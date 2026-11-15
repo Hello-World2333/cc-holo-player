@@ -7,7 +7,11 @@
    VP8 一帧要 ≈1.3×10⁶ 次迭代 ⇒ **3.6 秒/帧**，需要快 70 倍才到 20 fps。
    这不是优化问题。详见 `docs/adr/0002`。
 
-2. **别把像素塞进 CEE fabric。**
+2. **别用 `blit` 做运动补偿。** `blit` 每像素要做 2 次 `Double` 装箱 + 2 次 `HashMap` 查找（0.31 µs/px 端到端）；
+   「把上一帧的某块搬过来」应当用 `blitFrameBufferArea(...)`，那是纯 Java 逐字节拷贝。
+   把 MV 写成 Lua 循环会让成本从 ~10 µs 变成 ~1.3 ms，差 100 倍。详见 `docs/adr/0006`。
+
+3. **别把像素塞进 CEE fabric。**
    `bulkTokensPerTick=8` 是**每台发送机**的额度，且 `sizeOf(String)=16+2N`（UTF-16 计费），
    实际吞吐 ≈0.58 MB/s，喂一块 320×180@20fps 就是零余量。
    fabric 只跑 ack/栅栏/状态。详见 `docs/adr/0004`。
@@ -35,4 +39,8 @@
 
 ## 当前状态
 
-设计阶段。没有实现代码。下一步见 `docs/06` 的前三项。
+设计阶段。没有实现代码。
+
+**唯一阻塞项**：`docs/06` §1——4 台电脑是否共享同一个 hologram 外设实例
+（若是，`activateFrameBuffer` / `releaseAllFrameBuffer` 会互相干扰，整个多机方案要改）。
+其余待测项（§2/§3）只需要 20 行探针，不需要写完解码器。

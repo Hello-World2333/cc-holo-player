@@ -12,8 +12,9 @@ node/
 ├── tsconfig.json
 ├── src/
 │   ├── protocol.ts      ccv v1 的常量、编解码（与 docs/01 一一对应）
-│   ├── transcode.ts     离线转码：视频 → 分块/MV 分析 → .ccv
+│   ├── transcode.ts     离线转码：ffmpeg 出 rawvideo → 16×16 块匹配 → .ccv
 │   ├── verify.ts        逐帧 encode→decode 位精确校验（强制步骤）
+│   ├── decode.ts        参考解码器（与 cc/decoder.lua 位精确一致）
 │   ├── serve.ts         wss 分发 + room/quadrant 锁步 + ack
 │   ├── library.ts       .ccv 与 meta.json 的扫描
 │   └── util/            大端读写、日志
@@ -35,7 +36,7 @@ node/
 
 ```bash
 npm run build
-node dist/transcode --in movie.mp4 --out videos/movie --wall 640x360 --fps 20 --profile 1
+node dist/transcode --in movie.mp4 --out videos/movie --wall 640x360 --fps 20 --block 16
 node dist/verify    --in videos/movie
 node dist/serve     --dir videos --port 18755
 curl -s localhost:18755/health
@@ -48,4 +49,5 @@ curl -s localhost:18755/health
 
 ## 状态
 
-**尚未实现。** 先完成 `docs/06` 的 §1/§2/§3 三项实测，再动 `transcode.ts`。
+**尚未实现。** 动 `transcode.ts` 之前先看 `docs/06` §4 的编码器选型；
+更早之前要先解决 `docs/06` §1（多机共享外设）——它决定要不要「单机负责整个 640×360」。

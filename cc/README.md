@@ -7,7 +7,7 @@
 ```
 cc/
 ├── wall.lua       入口：读配置、找 hologram、连 ws、进事件循环
-├── decoder.lua    把一条 FRAME 消息解成若干 blit 调用（P1）
+├── decoder.lua    FRAME → MV(Java 拷贝) / RAW(blit 表)
 ├── renderer.lua   持有 prev/cur、调 blit、回 ack
 ├── master.lua     收 ack、调 h.sync()、fabric 广播
 ├── link.lua       ws 重连、保活、PING/PONG
