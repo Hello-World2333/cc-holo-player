@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copy the CC scripts onto a ComputerCraft computer's disk image.
+#
+#   tools/deploy.sh <computer-id> [world-dir]
+#
+# A CC computer's disk is just a directory in the world save, so we can write
+# straight into it while the server is stopped. The computer must be rebooted
+# (or the chunk reloaded) for CraftOS to pick the files up.
+set -euo pipefail
+
+ID="${1:?usage: deploy.sh <computer-id> [world-dir]}"
+WORLD="${2:-/mnt/data/linyun/hkx-simple/world}"
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+DST="$WORLD/computercraft/computer/$ID"
+
+[[ -d "$DST" ]] || { echo "no such computer dir: $DST" >&2; exit 1; }
+
+# Rack-mounted CEE computers have only 4 KB of disk (fs.getCapacity("/") == 4096),
+# which our ~9 KB of scripts cannot fit in. The "recharge" trick: a sparse file
+# whose nominal size counts against the quota at boot, deleted again in
+# startup.lua, drives used space negative for +1 GiB. See docs/05-部署.md §3.2.
+if [[ ! -e "$DST/padsize" ]]; then
+  truncate -s 1073741824 "$DST/padsize"
+  echo "created padsize (nominal 1 GiB, actual $(du -h "$DST/padsize" | cut -f1)) — reboot to recharge"
+fi
+
+cp "$SRC/cc/wall.lua"     "$DST/wall.lua"
+cp "$SRC/cc/decoder.lua"  "$DST/decoder.lua"
+
+# startup.lua runs the player on boot, replacing whatever was there.
+cat > "$DST/startup.lua" <<'LUA'
+-- Recharge trick (docs/05-部署.md §3.2): padsize is a sparse 1 GiB file that
+-- only exists so this delete can hand us the space. Deleting it is load-bearing.
+if fs.exists("/padsize") then fs.delete("/padsize") end
+shell.run("/wall.lua")
+LUA
+
+echo "deployed to computer $ID ($DST):"
+ls -la "$DST"

@@ -1,53 +1,53 @@
 # node/ · 公网侧
 
-两件事：**离线把视频转成 `.ccv`**，**把码流通过 wss 分发给 CC**。
+单包 TypeScript，`"private": true`，**不发布 npm**（`docs/adr/0005`）。
+依赖只有 `ws`，ffmpeg 通过 `child_process` 外部调用。
 
-单包，`"private": true`，**不发布 npm**。`tsc` 编到 `dist/`，`node dist/xxx` 直接跑。
+## 文件
 
-## 目录（规划）
-
-```
-node/
-├── package.json         private:true，依赖只有 ffmpeg 可执行文件（不装 npm 视频库）
-├── tsconfig.json
-├── src/
-│   ├── protocol.ts      ccv v1 的常量、编解码（与 docs/01 一一对应）
-│   ├── transcode.ts     离线转码：ffmpeg 出 rawvideo → 16×16 块匹配 → .ccv
-│   ├── verify.ts        逐帧 encode→decode 位精确校验（强制步骤）
-│   ├── decode.ts        参考解码器（与 cc/decoder.lua 位精确一致）
-│   ├── serve.ts         wss 分发 + room/quadrant 锁步 + ack
-│   ├── library.ts       .ccv 与 meta.json 的扫描
-│   └── util/            大端读写、日志
-└── dist/                构建产物（.gitignore）
-```
-
-## 依赖策略
-
-| 需要 | 怎么满足 |
+| 文件 | 作用 |
 |---|---|
-| 解任意视频容器/编码 | **外调 ffmpeg**（`child_process`），输出 `rgb24` raw 到管道 |
-| 分块 / 块匹配 / 打包 | **自己写**，纯 TS，无依赖 |
-| wss | `ws`（唯一运行时依赖） |
-| HTTP `/health` | 内置 `node:http` |
+| `src/protocol.ts` | `ccv v1` 的编解码。**唯一**的格式实现，与 `docs/01` 一一对应 |
+| `src/codec.ts` | 编码器（块匹配 + RAW/MV 判决）+ 参考解码器 `applyFrame` |
+| `src/container.ts` | `.ccv` 容器的读与写 |
+| `src/transcode.ts` | 离线转码：ffmpeg → rgb24 → 量化 → 编码 → `.ccv` |
+| `src/verify.ts` | 解回来、统计，可选导出 PNG |
+| `src/serve.ts` | wss 分发 + ACK 流控 + `/health` |
 
-不引入 fluent-ffmpeg / sharp / ffmpeg.wasm 之类的封装：目标环境就一个 VPS，直接调二进制最省事、最好排障。
-
-## 命令（规划）
+## 用法
 
 ```bash
-npm run build
-node dist/transcode --in movie.mp4 --out videos/movie --wall 640x360 --fps 20 --block 16
-node dist/verify    --in videos/movie
-node dist/serve     --dir videos --port 18755
+npm install && npm run build
+
+# 转码（输出 videos/<name>/{video.ccv,meta.json}）
+node dist/transcode.js --in movie.mp4 --out videos/movie --fps 20
+
+# 校验（解回来，统计；--png 0,40 导出指定帧）
+node dist/verify.js --dir videos/movie --png 0,40
+
+# 分发
+node dist/serve.js --dir videos --port 18755
 curl -s localhost:18755/health
 ```
 
-## 与 CC 的契约
+常用参数：
 
-线上字节格式**只**由 [`../docs/01-码流格式.md`](../docs/01-码流格式.md) 定义。
-`src/protocol.ts` 是它的唯一实现，任何字段改动必须先改文档再改代码（顺序不能反）。
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--w` / `--h` | 640 / 360 | 必须是 `--block` 的整数倍 |
+| `--block` | 20 | 块边长。640 与 360 的公因数：20、40、8… |
+| `--fps` | 20 | |
+| `--mv-mad` | 0.6 | MV 允许的平均误差（0–3 色阶）。越大 MV 越多、码率越低 |
+| `--budget` | 25 | 单帧解码预算 ms；超过则拆成多帧（渐进刷新） |
 
-## 状态
+## 两条不变量
 
-**尚未实现。** 动 `transcode.ts` 之前先看 `docs/06` §4 的编码器选型；
-更早之前要先解决 `docs/06` §1（多机共享外设）——它决定要不要「单机负责整个 640×360」。
+1. **`transcode` 每帧都自检**：编码器内部模型与参考解码器必须逐字节一致，
+   不一致直接 `exit 2`。这是自定义码流唯一的正确性防线。
+2. **`codec.ts` 的 `applyFrame` 必须与 `cc/decoder.lua` 等价**，
+   由 `tools/lua_conformance.mjs` 强制验证。
+
+## 为什么 `block` 默认 20
+
+块边长必须同时整除 640 和 360，否则边缘块越界。20 是能整除两者的较大值，
+且 32×18 = 576 块在预算内。`--block 16` 会因为 360/16 不整除而被拒绝。

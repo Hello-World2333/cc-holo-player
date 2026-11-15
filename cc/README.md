@@ -1,36 +1,62 @@
 # cc/ · 游戏内 Lua
 
-每台 CC 只负责一个 `region`。第一版 2×2，全局 640×360，每块 320×180。
+一台 CC 电脑负责**一整块 640×360 hologram**（见 `docs/adr/0007`）。
 
-## 目录（规划）
+| 文件 | 作用 |
+|---|---|
+| `wall.lua` | 入口：读配置、找 hologram、连 ws、事件循环、重连 |
+| `decoder.lua` | 把一条 `FRAME` 消息画到显示缓冲（MV 走 Java 拷贝，RAW 走 blit） |
+| `wall.cfg` | 部署时生成，**不在仓库里**（含 token） |
 
+## 部署
+
+电脑的「磁盘」就是世界存档里的一个目录，可以直接写进去（服务器开着也行，开机时才读）：
+
+```bash
+tools/deploy.sh 81                 # 复制脚本 + 生成 startup.lua
+$EDITOR /mnt/data/linyun/hkx-simple/world/computercraft/computer/81/wall.cfg
 ```
-cc/
-├── wall.lua       入口：读配置、找 hologram、连 ws、进事件循环
-├── decoder.lua    FRAME → MV(Java 拷贝) / RAW(blit 表)
-├── renderer.lua   持有 prev/cur、调 blit、回 ack
-├── master.lua     收 ack、调 h.sync()、fabric 广播
-├── link.lua       ws 重连、保活、PING/PONG
-└── wall.cfg       每台电脑一份（textutils.serialise，**不带 return**）
+
+### ⚠️ 先扩容，否则 `out of space`
+
+CEE:CC 的**机架式电脑只有 4 KB** 磁盘（`fs.getCapacity("/") == 4096`），
+本目录三个文件就 ~9 KB，必然存不下。用「黑魔法」充值一次即可，
+详见 [`../docs/05-部署.md`](../docs/05-部署.md) §3.2。简述：
+
+```bash
+cd world/computercraft/computer/<id>
+truncate -s 1073741824 padsize      # 名义 1 GiB、实际 0 字节的稀疏文件
 ```
 
-## 硬性约束（来自 `docs/02` 的实测）
+```lua
+-- startup.lua 第一行
+if fs.exists("/padsize") then fs.delete("/padsize") end
+```
 
-1. **禁止每像素 Lua 循环。** 解码只能是「整块 `string.sub` + 一次转表 + 一次 blit」。
-   每多一次逐像素运算，就会把 20 fps 推到个位数。
-2. **禁止常驻大表。** 4096 元素的表用完即弃；只保留 `prev` 字符串（57.6 KB）。
-3. **不要用 framebuffer**（`allocateFrameBuffer`）。它存在方块实体里、电脑重启不释放，
-   上一代因此把槽位占满。直接 blit 显示缓冲。
-4. **只有 master 调 `h.sync()`。**
-5. **不要靠 timer 驱动帧节奏。** hologram 的主线程 API 会吞排队事件；用「消息到达」驱动，
-   服务器每 200 ms 的 `PING` 就是为此存在。
+重启后 `fs.getFreeSpace("/")` ≈ 1 GiB，且**跨重启保持**。`capacity` 仍是 4096，
+变的是已用量被压成负数。
 
-## 电子盘注意
+`wall.cfg` 格式（`textutils.serialise`，**不带 `return`**）：
 
-- CC 电脑磁盘默认 1 MB；**不要**往电脑上放视频/码流文件，码流只走 ws 不落盘。
-- 换脚本后必须重启电脑才生效（CC 只在开机读 `startup.lua`）。
-- 日志要能关（`wall.cfg` 的 `log`），长期跑会吃满磁盘。
+```lua
+{ url  = "ws://10.0.0.5:18755/play?token=dev",
+  name = "mimi",
+  log  = true }
+```
 
-## 状态
+改完脚本或配置后**必须重启电脑**（`Ctrl+R` 或 `computercraft shutdown/turn-on`），
+CraftOS 只在开机时读 `startup.lua`。
 
-**尚未实现。** 先跑 `docs/06` §1 的探针（`blit` 是否吃字符串），它决定 `decoder.lua` 的写法。
+## 硬性约束
+
+1. **禁止每像素 Lua 循环。** MV 必须是 `blitFrameBufferArea`（一条 Java 调用）；
+   RAW 的「串→表」是唯一的逐像素代码，且必须 16 字节一批（实测快 3 倍）。
+2. **不要用 framebuffer 做双缓冲。** 只分配 1 个给 `prev`，显示缓冲用 `-1`。
+3. **只有一台电脑能碰这个 hologram。** 外设实例是共享的，「当前激活缓冲」是它上面的单个字段。
+4. **不要靠 timer 驱动帧节奏。** 用消息到达驱动；服务器每 200 ms 发 `PING`。
+5. 换脚本必须重启电脑。
+
+## 验证
+
+`tools/lua_conformance.mjs` 在 Lua VM 里跑本目录的 `decoder.lua`，
+与 `node/src/codec.ts` 的参考解码器逐像素对比。**改解码器后必须跑它。**

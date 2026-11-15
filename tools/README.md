@@ -38,3 +38,20 @@
 
 **尚未实现。** 第一个要写的是 `probe_shared_instance.lua`——它回答的是
 「4 台电脑能不能安全地各自分配 framebuffer」，答错的话整个多机架构要重做。
+
+## 已实现
+
+| 工具 | 作用 |
+|---|---|
+| `lua_conformance.mjs` | **在 Lua VM 里跑真实的 `cc/decoder.lua`**，用模拟 hologram 外设记录 `blit`/`blitFrameBufferArea`，与 `node/src/codec.ts` 的参考解码器逐像素对比。改解码器后必跑 |
+| `fake_cc.mjs` | 无头 CC：像真电脑一样连 ws、走完 HELLO/FRAME/ACK 流程并统计帧率码率。不需要进游戏就能验证服务端 |
+| `deploy.sh` | 把 `cc/*.lua` 写进某台电脑的存档目录，自动处理 `padsize` 扩容 |
+
+```bash
+node tools/lua_conformance.mjs videos/mimi/video.ccv
+node tools/fake_cc.mjs "ws://127.0.0.1:18756/play?token=dev" --frames 200
+tools/deploy.sh 81
+```
+
+`lua_conformance` 目前是唯一的「Lua 实现 == TS 实现」证据链：
+它抓到过一个真实 bug——编码器用二进制补码写 MV，而协议规定的是 `u8 + 128` 偏移。
