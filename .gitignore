@@ -1,0 +1,19 @@
+# 构建产物 / 依赖
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 视频与码流（体积大，不入库）
+videos/
+*.ccv
+*.mp4
+*.mkv
+
+# 捕获的帧 / 日志
+captures/
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
