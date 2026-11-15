@@ -26,6 +26,23 @@ fi
 
 cp "$SRC/cc/wall.lua"     "$DST/wall.lua"
 cp "$SRC/cc/decoder.lua"  "$DST/decoder.lua"
+cp "$SRC/cc/settings.lua" "$DST/settings.lua"
+cp "$SRC/cc/gui.lua"      "$DST/gui.lua"
+
+# wall.cfg is only created when absent, so an existing config (URL, name, the
+# data-hub pin the control screen lives on) survives a redeploy.
+if [[ ! -e "$DST/wall.cfg" ]]; then
+  cat > "$DST/wall.cfg" <<'CFG'
+{url="ws://127.0.0.1:18756/play?token=dev", name="mimi", log=true,
+ ctlHub=8, ctlPin=3}
+CFG
+  echo "wrote default wall.cfg (ctlHub/ctlPin = control screen pin)"
+fi
+
+# The Minecraft server does not run as the account that copies these files, and
+# CraftOS reports an unreadable file as "file not found" rather than "permission
+# denied" — which cost an hour once. Force world-readable.
+chmod 644 "$DST"/*.lua "$DST/wall.cfg" 2>/dev/null || true
 
 # startup.lua runs the player on boot, replacing whatever was there.
 cat > "$DST/startup.lua" <<'LUA'
