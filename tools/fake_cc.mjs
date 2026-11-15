@@ -124,6 +124,8 @@ ws.on("message", (data, isBinary) => { try {
   if (t === 0x01) {
     W = msg.readUInt16BE(4); H = msg.readUInt16BE(6); B = msg.readUInt8(2);
     console.error(`[fake_cc] HELLO ${W}x${H} block=${B} fps=${msg.readUInt8(3)}`);
+    // Same as cc/wall.lua: announce readiness or the server (correctly) waits.
+    ws.send(Buffer.from([0x02]), { binary: true });
     holo.resize(W, H);
     lua.lua_settop(L, 0);
     pushHolo(holo);

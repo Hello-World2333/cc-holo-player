@@ -43,24 +43,38 @@ function makeGrid(cfg: EncCfg): Rect {
 }
 
 /** SAD of block (bi) at offset (dx,dy) against prev, sampling every `stride` px. */
+/** Block origin in pixels. */
+function blockOrigin(g: Rect, bi: number): { px: number; py: number } {
+  return { px: (bi % g.bx) * g.block, py: Math.floor(bi / g.bx) * g.block };
+}
+
+/**
+ * True when the MV source rect lies fully inside the region.
+ * The hologram's blitFrameBufferArea does NOT clamp a negative source index —
+ * it indexes straight into the byte array and throws
+ * (java.lang.ArrayIndexOutOfBoundsException). So the encoder must never emit
+ * an MV that escapes the region. docs/01 §4.1 states this as an obligation.
+ */
+function mvInBounds(g: Rect, px: number, py: number, dx: number, dy: number): boolean {
+  const B = g.block;
+  return px + dx >= 0 && px + dx + B <= g.w && py + dy >= 0 && py + dy + B <= g.h;
+}
+
 function sadAt(
   cur: Uint8Array, prev: Uint8Array, g: Rect,
   bi: number, dx: number, dy: number, stride: number,
 ): number {
   const B = g.block;
-  const px = (bi % g.bx) * B;
-  const py = Math.floor(bi / g.bx) * B;
+  const { px, py } = blockOrigin(g, bi);
+  // Check the WHOLE rect up front: sampling with stride would otherwise accept a
+  // candidate whose last row/column falls outside the region.
+  if (!mvInBounds(g, px, py, dx, dy)) return Number.MAX_SAFE_INTEGER;
   let sad = 0;
   for (let y = 0; y < B; y += stride) {
-    const cy = py + y;
-    const ry = cy + dy;
-    if (ry < 0 || ry >= g.h) return Number.MAX_SAFE_INTEGER;
-    let ci = cy * g.w + px;
-    let ri = ry * g.w + px + dx;
+    const ry = py + y + dy;
+    const ci = (py + y) * g.w + px;
+    const ri = ry * g.w + px + dx;
     for (let x = 0; x < B; x += stride) {
-      const cx = px + x;
-      const rx = cx + dx;
-      if (rx < 0 || rx >= g.w) return Number.MAX_SAFE_INTEGER;
       sad += Math.abs(cur[ci + x] - prev[ri + x]);
     }
   }
@@ -70,9 +84,8 @@ function sadAt(
 /** Full-resolution SAD, clipped to bounds; returns MAX if the source rect escapes. */
 function sadFull(cur: Uint8Array, prev: Uint8Array, g: Rect, bi: number, dx: number, dy: number): number {
   const B = g.block;
-  const px = (bi % g.bx) * B;
-  const py = Math.floor(bi / g.bx) * B;
-  if (px + dx < 0 || px + dx + B > g.w || py + dy < 0 || py + dy + B > g.h) return Number.MAX_SAFE_INTEGER;
+  const { px, py } = blockOrigin(g, bi);
+  if (!mvInBounds(g, px, py, dx, dy)) return Number.MAX_SAFE_INTEGER;
   let sad = 0;
   for (let y = 0; y < B; y++) {
     let ci = (py + y) * g.w + px;
@@ -111,6 +124,10 @@ function searchMV(cur: Uint8Array, prev: Uint8Array, g: Rect, bi: number, sad0: 
     }
   }
   if (rx === 0 && ry === 0) return null;
+  // Belt and braces: a coarse candidate that refine could never improve on would
+  // otherwise survive here with an out-of-region source rect.
+  const { px, py } = blockOrigin(g, bi);
+  if (!mvInBounds(g, px, py, rx, ry)) return null;
   return { dx: rx, dy: ry, sad: rsad };
 }
 
@@ -172,6 +189,15 @@ export function encodeFrame(
 
     const mv = searchMV(cur, state, g, bi, sad0);
     if (mv && mv.sad / pxPerBlock <= opts.mvMad) {
+      // The CC calls hologram.blitFrameBufferArea, which throws on an
+      // out-of-region source index instead of clamping. Reject the vector here
+      // rather than emit a frame that kills the player.
+      const { px, py } = blockOrigin(g, bi);
+      if (!mvInBounds(g, px, py, mv.dx, mv.dy)) {
+        throw new Error(
+          `codec bug: MV (${mv.dx},${mv.dy}) for block ${bi} at (${px},${py}) escapes ${g.w}x${g.h}`,
+        );
+      }
       decided[bi] = { index: bi, mode: MODE.MV, dx: mv.dx, dy: mv.dy };
       mvBlocks++;
       continue;
@@ -293,7 +319,16 @@ export function applyFrame(
         for (let x = 0; x < B; x++) {
           const sx = px + x + blk.dx!;
           const sy = py + y + blk.dy!;
-          dst[dstOff + x] = sx < 0 || sx >= cfg.w || sy < 0 || sy >= cfg.h ? 0 : prev[srcOff + x];
+          // Mirror the hologram exactly: it does NOT clamp, it indexes the byte
+          // array and throws ArrayIndexOutOfBoundsException. Clipping to 0 here
+          // hid encoder bugs from this reference decoder — which is how a
+          // mis-ordered payload survived until the player crashed in-game.
+          if (sx < 0 || sx >= cfg.w || sy < 0 || sy >= cfg.h) {
+            throw new Error(
+              `reference decoder: MV escapes region at block ${blk.index} (${blk.dx},${blk.dy})`,
+            );
+          }
+          dst[dstOff + x] = prev[srcOff + x];
         }
       }
     }

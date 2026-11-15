@@ -108,14 +108,26 @@ local function connect()
   return ws
 end
 
+--- Send a binary control message.
+-- CC's Lua handle exposes only send/close/receive/getResponseHeaders — there is
+-- no sendBinary, and sendBinary/sendText are Java-internal. The frame type is
+-- chosen by the second argument: send(msg, true) = binary, send(msg) = text.
+-- Sending a control message as text is not harmless: the server's ws library
+-- validates the TEXT payload as UTF-8 and rewrites bytes >= 0x80 to U+FFFD,
+-- which was observed as a bogus "ack status=191 decode=48384ms" (48384 = 0xBD00,
+-- part of the replacement character).
+local function sendBin(ws, s)
+  pcall(ws.send, s, true)
+end
+
 local function sendAck(ws, seq, decodeMs)
-  local b = string.char(0x13, math.floor(seq / 256) % 256, seq % 256, 0,
-                         math.floor(decodeMs / 256) % 256, decodeMs % 256)
-  pcall(ws.send, b)
+  sendBin(ws, string.char(0x13, math.floor(seq / 256) % 256, seq % 256, 0,
+                          math.floor(decodeMs / 256) % 256, decodeMs % 256))
 end
 
 local function runOnce(ws)
-  local curSeq, pendingParts = -1, 0
+  local curSeq, nextPart, frameParts = -1, 0, 0
+  local broken = false
   local frameStart = 0
   local stats = { frames = 0, mv = 0, raw = 0, bytes = 0, decoded = 0 }
   local runStart = os.clock()
@@ -131,24 +143,38 @@ local function runOnce(ws)
       if t == 0x01 then
         stats.msgs = 0
         setupFromHello(msg)
+        -- Tell the server we finished resizing/allocating. Without this the
+        -- server streams immediately and the very first frame is lost while
+        -- resize() is still running.
+        sendBin(ws, string.char(0x02))
       elseif t == 0x10 then
         local t0 = os.clock()
         stats.msgs = (stats.msgs or 0) + 1
-        local seq, isLast, drawn = decoder.applyFrame(h, msg, st)
+        local seq, part, parts, drawn = decoder.applyFrame(h, msg, st)
         stats.decoded = stats.decoded + drawn
         stats.bytes = stats.bytes + #msg
-        if seq ~= curSeq then
-          curSeq = seq
-          pendingParts = string.byte(msg, 6)
+        if seq ~= curSeq or part == 0 then
+          curSeq, nextPart, frameParts = seq, 0, parts
           frameStart = t0
+          broken = false
         end
-        pendingParts = pendingParts - 1
-        if isLast and pendingParts <= 0 then
+        if part ~= nextPart then
+          -- A websocket message went missing (or arrived out of order). Blocks
+          -- already written are unrecoverable: the display no longer matches the
+          -- server's model, so redraw from scratch rather than run ahead corrupt.
+          broken = true
+        end
+        nextPart = part + 1
+        if part == parts - 1 then
+          sendAck(ws, seq, math.floor((os.clock() - frameStart) * 1000))
+          if broken then
+            say("lost part in seq=" .. tostring(seq) .. ", resyncing")
+            return "resync"
+          end
           decoder.snapshot(h, st)
           h.sync()
           stats.frames = stats.frames + 1
           local ms = math.floor((os.clock() - frameStart) * 1000)
-          sendAck(ws, seq, ms)
           if stats.frames == 1 or stats.frames % 20 == 0 then
             local el = os.clock() - runStart
             say(("frames=%d %.1ffps blocks=%d %.1fKB/s last=%dms")
@@ -160,7 +186,7 @@ local function runOnce(ws)
         say("control cmd=" .. cmd)
         if cmd == 4 then return "stop" end
       elseif t == 0x30 then
-        pcall(ws.send, string.char(0x31))
+        sendBin(ws, string.char(0x31))
       end
 
     elseif ev == "websocket_closed" and p1 == url then
@@ -187,6 +213,9 @@ while true do
     elseif why == "stop" then
       say("stopped by server")
       break
+    elseif why == "resync" then
+      -- reconnect: the server restarts at frame 0, which is a full key frame
+      sleep(1)
     else
       say("disconnected (" .. tostring(why) .. "), reconnecting")
       sleep(2)

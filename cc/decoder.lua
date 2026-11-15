@@ -32,7 +32,7 @@ end
 M.buildTable = buildTable
 
 --- Decode one FRAME message and draw it.
--- Returns seq, isLastPart, drawnBlocks
+-- Returns seq, part, parts, drawnBlocks
 function M.applyFrame(h, msg, st)
   local seq   = byte(msg, 2) * 256 + byte(msg, 3)
   local part  = byte(msg, 5)
@@ -73,7 +73,10 @@ function M.applyFrame(h, msg, st)
     end
   end
 
-  return seq, part == parts - 1, drawn
+  -- part/parts are returned so the caller can detect a lost ws message. The
+  -- wire format has no redundancy, so a missing part means the display no
+  -- longer matches the encoder's model and the frame must be thrown away.
+  return seq, part, parts, drawn
 end
 
 --- Copy display -> prev so the next frame's MV reads frame N-1.

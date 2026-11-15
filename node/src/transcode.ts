@@ -10,7 +10,7 @@ import { CcvWriter } from "./container.js";
 import {
   DEFAULT_OPTS, encodeFrame, quantize, applyFrame, EncOptions,
 } from "./codec.js";
-import { VERSION, frameParts } from "./protocol.js";
+import { VERSION, frameParts, decodeFrame } from "./protocol.js";
 
 const MAX_MSG = 48 * 1024;
 
@@ -89,17 +89,31 @@ ff.stdout.on("data", (chunk: Buffer) => {
       refPrev = new Uint8Array(W * H);
     }
 
+    const preSnapA = process.env.DIVERGE_DEBUG ? Uint8Array.from(prev) : null;
+    const preSnapB = process.env.DIVERGE_DEBUG ? Uint8Array.from(refPrev) : null;
     const frames = encodeFrame(cur, prev, { w: W, h: H, block: BLOCK }, seq, opts);
+    const dbgBlocks = [];
     const timeMs = Math.round((frameIdx * 1000) / fps);
 
     for (const f of frames) {
-      // bit-exactness check: the reference decoder must land where the encoder expects
-      applyFrame(refDisplay, refPrev, { w: W, h: H, block: BLOCK }, f.blocks);
-      refPrev.set(refDisplay);
       const parts = frameParts(f.seq, f.flags, Math.ceil(W / BLOCK), Math.ceil(H / BLOCK), f.blocks, MAX_MSG);
       for (const p of parts) {
+        // Bit-exactness check, run on the BYTES we are about to ship rather than
+        // on the encoder's in-memory blocks. The wire format carries no block
+        // indices (the decoder re-derives them from the bitmap), so a payload
+        // that is not sorted by index decodes into the wrong block — a whole
+        // class of bug that an in-memory check cannot see.
+        const decoded = decodeFrame(p, BLOCK);
+        dbgBlocks.push(...decoded.blocks);
+        applyFrame(refDisplay, refPrev, { w: W, h: H, block: BLOCK }, decoded.blocks);
+
         const partIdx = p.readUInt8(4);
         const partTotal = p.readUInt8(5);
+        // The CC only copies display->prev once the whole frame has arrived
+        // (wall.lua: `if isLast and pendingParts <= 0 then decoder.snapshot`).
+        // Advancing prev per ws-part here made this checker disagree with the
+        // real player on frames split over several messages.
+        if (partIdx === partTotal - 1) refPrev.set(refDisplay);
         writer.add(p, f.seq, partIdx, partTotal, timeMs);
         totalBytes += p.length;
         totalMsgs++;
@@ -110,8 +124,35 @@ ff.stdout.on("data", (chunk: Buffer) => {
       seq++;
     }
 
+    let diffPx = 0, firstDiff = -1;
     for (let i = 0; i < prev.length; i++) {
-      if (prev[i] !== refPrev[i]) { mismatch++; break; }
+      if (prev[i] !== refPrev[i]) {
+        diffPx++;
+        if (firstDiff < 0) firstDiff = i;
+      }
+    }
+    if (diffPx > 0) {
+      mismatch++;
+      if (process.env.DIVERGE_DEBUG && mismatch <= 3) {
+        const dX = firstDiff % W, dY = Math.floor(firstDiff / W);
+        const bi = Math.floor(dY / BLOCK) * Math.ceil(W / BLOCK) + Math.floor(dX / BLOCK);
+        const blk = dbgBlocks.find((b) => b.index === bi);
+        let preDiff = 0;
+        const A = preSnapA, Bs = preSnapB;
+        if (A && Bs) {
+          for (let i = 0; i < A.length; i++) if (A[i] !== Bs[i]) preDiff++;
+        }
+        const sX = dX + (blk && blk.dx !== undefined ? blk.dx : 0);
+        const sY = dY + (blk && blk.dy !== undefined ? blk.dy : 0);
+        console.error(
+          `  [diverge] preDiff=${preDiff} src=(${sX},${sY}) ` +
+          `encSrc=${A ? A[sY * W + sX] : -1} refSrc=${Bs ? Bs[sY * W + sX] : -1} ` +
+          `  [diverge] frame=${frameIdx} seq=${seq} parts=${frames.length} diffPx=${diffPx} ` +
+          `first=(${dX},${dY}) block=${bi} mode=${blk ? blk.mode : "absent"} ` +
+          `mv=(${blk ? blk.dx : ""},${blk ? blk.dy : ""}) ` +
+          `enc=${prev[firstDiff]} ref=${refPrev[firstDiff]} cur=${cur[firstDiff]}`,
+        );
+      }
     }
     frameIdx++;
     if (frameIdx % 50 === 0) {

@@ -115,8 +115,14 @@ export function encodeFramePart(
 ): Buffer {
   const nBitmap = bitmapBytes(bx, by);
   const bm = Buffer.alloc(nBitmap);
+  // The wire format carries no per-block index: the decoder walks the bitmap in
+  // ascending block order and pairs it with the payload records in order. So the
+  // records MUST be sorted by index. The progressive-refresh path builds a part as
+  // [...MV blocks, ...RAW blocks], which is not ascending — sorting here is what
+  // keeps encoder and decoder talking about the same blocks.
+  const ordered = [...blocks].sort((a, b) => a.index - b.index);
   let payload = 0;
-  for (const blk of blocks) {
+  for (const blk of ordered) {
     bm[blk.index >> 3] |= 1 << (blk.index & 7);
     payload += 1 + blockPayloadCost(blk);
   }
@@ -130,7 +136,7 @@ export function encodeFramePart(
   out.writeUInt8(by, 7);
   bm.copy(out, FRAME_HDR);
   let p = FRAME_HDR + nBitmap;
-  for (const blk of blocks) {
+  for (const blk of ordered) {
     if (blk.mode === MODE.MV) {
       out.writeUInt8(MODE.MV, p); p += 1;
       // docs/01 §2: signed values are u8 biased by +128, not two's complement.

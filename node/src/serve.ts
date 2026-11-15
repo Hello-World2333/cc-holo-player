@@ -85,6 +85,11 @@ wss.on("connection", (ws, req) => {
   // but the client only acks it once, so counting messages would deadlock.
   let inFlight = 0;
   let ackedSeq = -1;
+  // Streaming only starts once the client says it has finished setting up its
+  // hologram. Without this gate the first 49 KB frame is sent while the CC is
+  // still inside resize()/allocateFrameBuffer() and that message is lost — the
+  // player then starts from frame 0 part 1 and every frame is corrupt.
+  let clientReady = false;
   let idx = 0;
   let startAt = 0;
   let lastTimeMs = 0;
@@ -120,7 +125,10 @@ wss.on("connection", (ws, req) => {
     } else if (t === MSG.PONG) {
       // keepalive
     } else if (t === MSG.READY) {
-      console.error(`[serve] READY from client: ${data.subarray(1).toString("ascii")}`);
+      if (!clientReady) {
+        clientReady = true;
+        console.error("[serve] client READY, starting stream");
+      }
     }
   });
 
@@ -128,7 +136,17 @@ wss.on("connection", (ws, req) => {
     console.error(`[serve] client disconnected (loops=${loopCount}, sent=${idx} msgs)`);
     clearInterval(tick);
     clearInterval(ping);
+    clearTimeout(readyTimeout);
   });
+
+  // Compatibility escape hatch: an older client (or one with a broken READY path)
+  // would otherwise never receive anything. Start anyway, but late and noisily.
+  const readyTimeout = setTimeout(() => {
+    if (!clientReady && ws.readyState === WebSocket.OPEN) {
+      console.error("[serve] WARNING: no READY after 3s, streaming anyway");
+      clientReady = true;
+    }
+  }, 3000);
 
   let ticks = 0;
   const tick = setInterval(() => {
@@ -136,6 +154,7 @@ wss.on("connection", (ws, req) => {
       console.error(`[dbg] tick idx=${idx} inFlight=${inFlight} ready=${ws.readyState === WebSocket.OPEN}`);
     }
     if (ws.readyState !== WebSocket.OPEN) return;
+    if (!clientReady) return;
     if (inFlight >= CREDIT) return;
     if (idx >= v.recs.length) {
       if (doLoop) { if (inFlight === 0) restart(); }
