@@ -3,6 +3,7 @@
  * The reference decoder MUST be bit-exact with cc/decoder.lua.
  */
 import { BlockData, MODE, FRAME_FLAG_KEY } from "./protocol.js";
+import type { TileAtlas } from "./atlas.js";
 
 /** 2-bit-per-channel palette levels; must match the CC side's setColorMapping. */
 export const LEVELS = [0, 85, 170, 255];
@@ -92,20 +93,45 @@ export function quantize(
   // instead of ±42.5, which randomises the image instead of dithering it.
   const cells = mat ? mat.length * mat.length : 0;
   const out = new Uint8Array(w * h);
+
+  if (!mat) {
+    // No dither: one lookup table for every pixel.
+    const L = new Uint8Array(256);
+    for (let c = 0; c < 256; c++) L[c] = q(c, 0);
+    for (let i = 0, p = 0; i < w * h; i++, p += 3) {
+      out[i] = (L[rgb[p]] << 6) | (L[rgb[p + 1]] << 4) | (L[rgb[p + 2]] << 2) | 3;
+    }
+    return out;
+  }
+
+  // One 256-entry table per Bayer cell. The offset depends only on (x mod n,
+  // y mod n), so every threshold decision is a table lookup instead of three
+  // divisions and three Math.round calls per pixel — quantize was 54ns/pixel,
+  // which is absurd for what is arithmetically a divide-by-85.
+  const n = mat.length;
+  const luts: Uint8Array[] = new Array(cells);
+  for (let cy = 0; cy < n; cy++) {
+    for (let cx = 0; cx < n; cx++) {
+      // (m + 0.5)/cells - 0.5 spans (-0.5, 0.5), scaled to one level: ±42.5.
+      const off = ((mat[cy][cx] + 0.5) / cells - 0.5) * STEP * strength;
+      const L = new Uint8Array(256);
+      for (let c = 0; c < 256; c++) L[c] = q(c, off);
+      luts[cy * n + cx] = L;
+    }
+  }
+  // Walk the Bayer matrix by row so the per-row table slice is contiguous.
+  const rowLuts: Uint8Array[][] = new Array(n);
+  for (let cy = 0; cy < n; cy++) {
+    rowLuts[cy] = luts.slice(cy * n, cy * n + n);
+  }
   for (let y = 0; y < h; y++) {
+    const row = rowLuts[y & (n - 1)];
+    const base = y * w;
     for (let x = 0; x < w; x++) {
-      const p = (y * w + x) * 3;
-      let off = 0;
-      if (mat) {
-        // (m + 0.5)/cells - 0.5 spans (-0.5, 0.5), scaled to one level: ±42.5.
-        const n = mat.length;
-        off = ((mat[y % n][x % n] + 0.5) / cells - 0.5) * STEP * strength;
-      }
-      out[y * w + x] =
-        (q(rgb[p], off) << 6) |
-        (q(rgb[p + 1], off) << 4) |
-        (q(rgb[p + 2], off) << 2) |
-        3;
+      const L = row[x & (n - 1)];
+      const p = (base + x) * 3;
+      out[base + x] =
+        (L[rgb[p]] << 6) | (L[rgb[p + 1]] << 4) | (L[rgb[p + 2]] << 2) | 3;
     }
   }
   return out;
@@ -319,6 +345,13 @@ export interface EncOptions {
   rawUs: number;
   /** target per-frame decode budget in ms */
   budgetMs: number;
+  /**
+   * Atlas matching tolerance. Tiles are matched with the same per-channel level
+   * error metric as SKIP/MV, and these are the caps used for a match to count.
+   * Measured on real content: 8x8 tiles hit 65-69% at these values.
+   */
+  atlasMaxPx: number;
+  atlasMaxMean: number;
 }
 
 /** Can this block (at this offset) be replaced by a copy of prev? */
@@ -337,10 +370,14 @@ export const DEFAULT_OPTS: EncOptions = {
   copyTol: 0.25,
   copyMaxPx: 2,
   copyMaxDiffPct: 0.3,
-  searchRadius: 24,
+  // 24 was the old default. At block=8 with the atlas enabled, 8 measures within
+  // 0.6% of the same bitrate for a third less encoder time (docs/02 §4.2).
+  searchRadius: 8,
   mvUs: 10,
   rawUs: 0.31,
   budgetMs: 25,
+  atlasMaxPx: 2,
+  atlasMaxMean: 0.25,
 };
 
 export interface EncodedFrame {
@@ -349,6 +386,7 @@ export interface EncodedFrame {
   blocks: BlockData[];
   rawPixels: number;
   mvBlocks: number;
+  atlasBlocks: number;
   skipBlocks: number;
   estimatedMs: number;
 }
@@ -367,6 +405,10 @@ export function encodeFrame(
   cfg: EncCfg,
   seqStart: number,
   opts: EncOptions = DEFAULT_OPTS,
+  /** Supply to enable atlas coding; omit to code every changed block as RAW. */
+  atlas?: TileAtlas,
+  /** frame counter, used for LRU bookkeeping */
+  frame = 0,
 ): EncodedFrame[] {
   const g = makeGrid(cfg);
   const B = cfg.block;
@@ -375,7 +417,7 @@ export function encodeFrame(
 
   // ---- pass 1: decide every block, estimate the cost
   const decided: (BlockData | null)[] = new Array(nBlocks).fill(null);
-  let rawPixels = 0, mvBlocks = 0;
+  let rawPixels = 0, mvBlocks = 0, atlasBlocks = 0;
 
   for (let bi = 0; bi < nBlocks; bi++) {
     // SKIP is "copy the previous frame's block at zero offset". It used to
@@ -387,6 +429,20 @@ export function encodeFrame(
     // the block grid collapse; see docs/02 §6.5.
     const zero = sadChanStats(cur, state, g, bi, 0, 0, 1);
     if (zero && canReuse(zero, opts)) continue;
+
+    // Pack the tile once; the atlas and the RAW fallback both need these bytes.
+    const px = (bi % g.bx) * B;
+    const py = Math.floor(bi / g.bx) * B;
+    let buf: Buffer | null = null;
+    const packTile = () => {
+      if (buf) return buf;
+      buf = Buffer.alloc(pxPerBlock);
+      for (let y = 0; y < B; y++) {
+        const src = (py + y) * g.w + px;
+        buf.set(cur.subarray(src, src + B), y * B);
+      }
+      return buf;
+    };
 
     const mv = searchMV(cur, state, g, bi, opts);
     if (mv) {
@@ -403,18 +459,30 @@ export function encodeFrame(
       mvBlocks++;
       continue;
     }
-    const px = (bi % g.bx) * B;
-    const py = Math.floor(bi / g.bx) * B;
-    const buf = Buffer.alloc(pxPerBlock);
-    for (let y = 0; y < B; y++) {
-      const src = (py + y) * g.w + px;
-      buf.set(cur.subarray(src, src + B), y * B);
+    const tile = packTile();
+    if (atlas && atlas.tile === B) {
+      // Motion search runs first: an MV costs 3 bytes on the wire against 4 for
+      // an ATLAS reference, and it is the only way to exploit motion the atlas
+      // cannot represent. Only when both fail does this become a new tile.
+      const hit = atlas.find(tile, frame, opts.atlasMaxPx, opts.atlasMaxMean);
+      if (hit >= 0) {
+        decided[bi] = { index: bi, mode: MODE.ATLAS, atlasPos: hit };
+        atlasBlocks++;
+        continue;
+      }
+      const pos = atlas.alloc(frame);
+      atlas.store(tile, pos, frame);
+      decided[bi] = { index: bi, mode: MODE.RAW, atlasPos: pos, pixels: tile };
+      rawPixels += pxPerBlock;
+      continue;
     }
-    decided[bi] = { index: bi, mode: MODE.RAW, pixels: buf };
+    decided[bi] = { index: bi, mode: MODE.RAW, pixels: tile };
     rawPixels += pxPerBlock;
   }
 
-  const estimatedMs = (rawPixels * opts.rawUs + mvBlocks * opts.mvUs) / 1000;
+  // ATLAS blocks cost the same shape of call as MV (one area blit), not rawUs.
+  const estimatedMs =
+    (rawPixels * opts.rawUs + (mvBlocks + atlasBlocks) * opts.mvUs) / 1000;
   const needsSplit = estimatedMs > opts.budgetMs;
 
   // The CC keeps display and prev in two separate framebuffers: MV reads prev and
@@ -428,7 +496,13 @@ export function encodeFrame(
     for (const blk of blocks) {
       const px = (blk.index % bx) * B;
       const py = Math.floor(blk.index / bx) * B;
-      if (blk.mode === MODE.RAW) {
+      if (blk.mode === MODE.ATLAS) {
+        const tile = atlas ? atlas.get(blk.atlasPos!) : undefined;
+        if (!tile) throw new Error(`encoder: ATLAS position ${blk.atlasPos} empty`);
+        for (let y = 0; y < B; y++) {
+          next.set(tile.subarray(y * B, y * B + B), (py + y) * g.w + px);
+        }
+      } else if (blk.mode === MODE.RAW) {
         for (let y = 0; y < B; y++) {
           next.set(blk.pixels!.subarray(y * B, y * B + B), (py + y) * g.w + px);
         }
@@ -450,7 +524,7 @@ export function encodeFrame(
     const blocks = decided.filter((d): d is BlockData => d !== null);
     applyGroup(blocks);
     frames.push({
-      seq: seqStart, flags: 0, blocks, rawPixels, mvBlocks,
+      seq: seqStart, flags: 0, blocks, rawPixels, mvBlocks, atlasBlocks,
       skipBlocks: nBlocks - blocks.length, estimatedMs,
     });
     return frames;
@@ -459,21 +533,36 @@ export function encodeFrame(
   // ---- progressive refresh: part 0 carries all MVs, later parts RAW only.
   // No MV in later parts, because each part ends with a display->prev copy and a
   // later MV would then read already-updated pixels instead of the frame N-1 state.
-  const perPartPx = Math.max(pxPerBlock, Math.floor((opts.budgetMs * 1000) / opts.rawUs));
+  const budgetUs = opts.budgetMs * 1000;
   const mvList = decided.filter((d): d is BlockData => d !== null && d.mode === MODE.MV);
-  const rawList = decided.filter((d): d is BlockData => d !== null && d.mode === MODE.RAW);
+  // ATLAS must travel with the RAW blocks, in ascending block order, and never in
+  // part 0. Two reasons, both load-bearing:
+  //   * a tile is stored at the position sent WITH the RAW block that carries it,
+  //     so an ATLAS reference is only valid once that store has been decoded. In
+  //     ascending order the store's block index is always smaller than the
+  //     reference's, which is exactly the guarantee needed.
+  //   * part 0 carries every MV, and each part ends with a display->prev snapshot;
+  //     an ATLAS copy in part 0 would be fine for prev but would still have to
+  //     respect the store-before-reference rule, which part 0 cannot.
+  // Dropping ATLAS here (the earlier bug) silently blanked 137600 pixels on any
+  // frame large enough to split.
+  const bodyList = decided
+    .filter((d): d is BlockData => d !== null && (d.mode === MODE.RAW || d.mode === MODE.ATLAS))
+    .sort((a, b) => a.index - b.index);
+  const costUs = (blk: BlockData) =>
+    blk.mode === MODE.RAW ? pxPerBlock * opts.rawUs : opts.mvUs;
 
   const parts: BlockData[][] = [];
   let curPart: BlockData[] = [...mvList];
   let curPartPx = 0;
-  for (const blk of rawList) {
-    if (curPartPx > 0 && curPartPx + pxPerBlock > perPartPx) {
+  for (const blk of bodyList) {
+    if (curPartPx > 0 && curPartPx + costUs(blk) > budgetUs) {
       parts.push(curPart);
       curPart = [];
       curPartPx = 0;
     }
     curPart.push(blk);
-    curPartPx += pxPerBlock;
+    curPartPx += costUs(blk);
   }
   if (curPart.length > 0) parts.push(curPart);
 
@@ -481,12 +570,15 @@ export function encodeFrame(
     const blocks = parts[k];
     const rawPx = blocks.filter((b) => b.mode === MODE.RAW).length * pxPerBlock;
     const mvN = blocks.filter((b) => b.mode === MODE.MV).length;
-    const est = (rawPx * opts.rawUs + mvN * opts.mvUs) / 1000;
+    // An ATLAS block is one cross-slot area blit, the same shape of cost as MV,
+    // so it is estimated with mvUs rather than rawUs.
+    const atlN = blocks.filter((b) => b.mode === MODE.ATLAS).length;
+    const est = (rawPx * opts.rawUs + (mvN + atlN) * opts.mvUs) / 1000;
     applyGroup(blocks);
     frames.push({
       seq: seqStart + k,
       flags: k === 0 ? FRAME_FLAG_KEY : 0,
-      blocks, rawPixels: rawPx, mvBlocks: mvN,
+      blocks, rawPixels: rawPx, mvBlocks: mvN, atlasBlocks: atlN,
       skipBlocks: nBlocks - blocks.length, estimatedMs: est,
     });
   }
@@ -502,13 +594,31 @@ export function applyFrame(
   prev: Uint8Array,
   cfg: EncCfg,
   blocks: BlockData[],
+  atlas?: TileAtlas,
 ) {
   const B = cfg.block;
   const bx = Math.ceil(cfg.w / B);
   for (const blk of blocks) {
     const px = (blk.index % bx) * B;
     const py = Math.floor(blk.index / bx) * B;
+    if (blk.mode === MODE.ATLAS) {
+      // Copy the stored tile. Encoding an ATLAS block whose position still holds
+      // nothing would make the CC read a zeroed slot, so this is a hard error
+      // rather than a silent blank tile.
+      if (!atlas) throw new Error("reference decoder: ATLAS block but no atlas supplied");
+      const tile = atlas.get(blk.atlasPos!);
+      if (!tile) {
+        throw new Error(`reference decoder: ATLAS position ${blk.atlasPos} is empty at block ${blk.index}`);
+      }
+      for (let y = 0; y < B; y++) {
+        dst.set(tile.subarray(y * B, y * B + B), (py + y) * cfg.w + px);
+      }
+      continue;
+    }
     if (blk.mode === MODE.RAW) {
+      // A RAW block is drawn and then written into the atlas, in that order: the
+      // decoder needs the pixels on screen whether or not it keeps a copy.
+      if (atlas && blk.atlasPos !== undefined) atlas.store(blk.pixels!, blk.atlasPos, -1);
       for (let y = 0; y < B; y++) {
         const dstOff = (py + y) * cfg.w + px;
         dst.set(blk.pixels!.subarray(y * B, y * B + B), dstOff);

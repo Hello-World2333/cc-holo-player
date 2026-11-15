@@ -5,8 +5,13 @@
  */
 import * as fs from "node:fs";
 
-export const CCV_MAGIC = "CCV1";
-export const CCV_VERSION = 1;
+/**
+ * Magic carries the format generation, not the app name: a v1 file's header
+ * layout differs (no atlas fields), so accepting it on the magic alone would
+ * misparse every field after the duration.
+ */
+export const CCV_MAGIC = "CCV2";
+export const CCV_VERSION = 2;
 export const HDR_SIZE = 48;
 export const REC_SIZE = 16;
 
@@ -23,6 +28,15 @@ export interface CcvHeader {
   msgCount: number;
   indexOffset: number;
   durationMs: number;
+  /**
+   * Atlas geometry. The decoder must allocate these slots before the first
+   * frame, and it cannot infer them: `tiles` are addressed by a flat position
+   * whose mapping to (slot, x, y) depends entirely on this geometry.
+   * Zero slots means the file is not atlas-coded.
+   */
+  atlasSlots: number;
+  atlasSlotW: number;
+  atlasSlotH: number;
 }
 
 export interface CcvRecord {
@@ -79,6 +93,9 @@ export class CcvWriter {
     hdr.writeUInt32BE(this.idx.length, 20);
     hdr.writeUInt32BE(indexOffset, 24);
     hdr.writeUInt32BE(durationMs, 28);
+    hdr.writeUInt8(this.header.atlasSlots, 32);
+    hdr.writeUInt16BE(this.header.atlasSlotW, 33);
+    hdr.writeUInt16BE(this.header.atlasSlotH, 35);
     fs.writeSync(this.fd, hdr, 0, HDR_SIZE, 0);
     fs.closeSync(this.fd);
     return {
@@ -93,7 +110,14 @@ export class CcvWriter {
 export function readCcvHeader(fd: number): CcvHeader {
   const b = Buffer.alloc(HDR_SIZE);
   fs.readSync(fd, b, 0, HDR_SIZE, 0);
-  if (b.toString("ascii", 0, 4) !== CCV_MAGIC) throw new Error("not a .ccv file");
+  const magic = b.toString("ascii", 0, 4);
+  if (magic !== CCV_MAGIC) {
+    throw new Error(
+      magic === "CCV1"
+        ? "this is a ccv v1 file; re-transcode it (the atlas fields changed the header)"
+        : `not a .ccv file (magic ${JSON.stringify(magic)})`,
+    );
+  }
   return {
     version: b.readUInt8(4),
     block: b.readUInt8(5),
@@ -107,6 +131,9 @@ export function readCcvHeader(fd: number): CcvHeader {
     msgCount: b.readUInt32BE(20),
     indexOffset: b.readUInt32BE(24),
     durationMs: b.readUInt32BE(28),
+    atlasSlots: b.readUInt8(32),
+    atlasSlotW: b.readUInt16BE(33),
+    atlasSlotH: b.readUInt16BE(35),
   };
 }
 

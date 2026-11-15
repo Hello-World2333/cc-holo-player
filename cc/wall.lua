@@ -42,7 +42,7 @@ local function findMethods()
   -- peripheral.find gives us the wrapped object; verify the methods we need exist.
   for _, name in ipairs({ "resize", "setColorMapping", "blit", "activateFrameBuffer",
                           "blitFrameBufferArea", "allocateFrameBuffer",
-                          "releaseAllFrameBuffer", "sync" }) do
+                          "releaseAllFrameBuffer", "clear", "sync" }) do
     if type(h[name]) ~= "function" then
       error("hologram is missing method: " .. name)
     end
@@ -120,8 +120,17 @@ local function setupFromHello(msg)
   local ry      = string.byte(msg, 11) * 256 + string.byte(msg, 12)
   local rw      = string.byte(msg, 13) * 256 + string.byte(msg, 14)
   local rh      = string.byte(msg, 15) * 256 + string.byte(msg, 16)
+  -- v2 appends the atlas geometry. A v2 server always sends it; the length check
+  -- keeps a v1 file readable instead of indexing past the end of the string.
+  local aTile, aSlotW, aSlotH, aSlots
+  if #msg >= 23 then
+    aTile  = string.byte(msg, 19)
+    aSlotW = string.byte(msg, 20) * 256 + string.byte(msg, 21)
+    aSlotH = string.byte(msg, 22) * 256 + string.byte(msg, 23)
+    aSlots = string.byte(msg, 24)
+  end
 
-  if version ~= 1 then error("protocol version mismatch: server=" .. version .. " client=1") end
+  if version ~= 2 then error("protocol version mismatch: server=" .. version .. " client=2") end
 
   st.block   = block
   st.regionW = rw
@@ -142,10 +151,38 @@ local function setupFromHello(msg)
   st.displayId = -1   -- -1 means "the display buffer"
   st.prevId = h.allocateFrameBuffer(rw, rh)
   if st.prevId < 0 then error("allocateFrameBuffer failed (slots full?)") end
+
+  -- Atlas slots. The hologram caps each slot at 393216 bytes (getMaxBufferSize)
+  -- and allows 16 per peripheral. The server picks the geometry and sends it in
+  -- HELLO, because tile positions are meaningless without it.
+  st.atlasIds = nil
+  st.activeSlot = st.displayId
+  if aSlots and aSlots > 0 and aSlotW and aSlotH and aSlotW * aSlotH <= 393216 then
+    local ids = {}
+    for i = 1, aSlots do
+      local id = h.allocateFrameBuffer(aSlotW, aSlotH)
+      if id < 0 then
+        -- Fewer slots than the encoder expects would make every reference past
+        -- the end index a nil entry and paint garbage, so refuse to start instead.
+        error(("atlas: slot %d of %d refused (only %d allocated)"):format(i, aSlots, #ids))
+      end
+      ids[i] = id
+    end
+    st.atlasIds = ids
+    st.atlasTilesPerRow = math.floor(aSlotW / aTile)
+    st.atlasTilesPerSlot = math.floor(aSlotW / aTile) * math.floor(aSlotH / aTile)
+    -- Clear every tile position once: a never-written slot holds whatever the
+    -- allocation gave it, and a reference to an uncleared position would show it.
+    for i = 1, #ids do
+      h.activateFrameBuffer(ids[i])
+      h.clear(3)
+    end
+  end
   h.activateFrameBuffer(st.displayId)
 
-  say(("hello v%d %dx%d block=%d region=%d,%d %dx%d fps=%d prev=%d")
-      :format(version, wallW, wallH, block, rx, ry, rw, rh, fps, st.prevId))
+  say(("hello v%d %dx%d block=%d region=%d,%d %dx%d fps=%d prev=%d atlas=%d")
+      :format(version, wallW, wallH, block, rx, ry, rw, rh, fps, st.prevId,
+              st.atlasIds and #st.atlasIds or 0))
   return fps
 end
 

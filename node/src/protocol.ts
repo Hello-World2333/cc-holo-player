@@ -3,7 +3,7 @@
  * Big-endian. Bump VERSION on ANY incompatible change.
  */
 
-export const VERSION = 1;
+export const VERSION = 2;
 
 export const MSG = {
   HELLO: 0x01,
@@ -16,11 +16,35 @@ export const MSG = {
   PONG: 0x31,
 } as const;
 
-export const MODE = { MV: 1, RAW: 2 } as const;
+/**
+ * Block modes. Both reuse modes carry a 3-byte atlas position, so the decoder
+ * never has to guess where a tile lives: the encoder owns the whole atlas policy
+ * (content matching, LRU eviction) and just states the answer.
+ */
+export const MODE = {
+  /** copy block from prev at (dx,dy) */
+  MV: 1,
+  /** 3-byte atlas position + tileSize*tileSize raw bytes; also stored into the atlas */
+  RAW: 2,
+  /** 3-byte atlas position; copy the tile from the atlas */
+  ATLAS: 3,
+} as const;
+
+export type Mode = 1 | 2 | 3;
 
 /** type(1) seq(2) flags(1) part(1) parts(1) bx(1) by(1) = 8 */
 export const FRAME_HDR = 8;
 export const FRAME_FLAG_KEY = 1;
+
+export interface AtlasCfg {
+  /** tile edge in pixels; always equal to the block size */
+  tile: number;
+  /** per-slot geometry, must satisfy slotW*slotH <= 393216 */
+  slotW: number;
+  slotH: number;
+  /** number of offscreen framebuffer slots devoted to the atlas */
+  slots: number;
+}
 
 export interface HelloMsg {
   version: number;
@@ -34,15 +58,19 @@ export interface HelloMsg {
   regionH: number;
   flags: number;
   name: string;
+  atlas: AtlasCfg;
 }
 
 export interface BlockData {
   /** linear block index, row-major: by * bx + x */
   index: number;
-  mode: 1 | 2;
+  mode: Mode;
   dx?: number; // MV only, signed
   dy?: number; // MV only, signed
-  pixels?: Buffer; // RAW only: block*block bytes, row-major
+  /** RAW / ATLAS: position in the atlas */
+  atlasPos?: number;
+  /** RAW only: block*block bytes, row-major */
+  pixels?: Buffer;
 }
 
 export interface FrameMsg {
@@ -63,14 +91,23 @@ export function bitmapBytes(bx: number, by: number): number {
   return Math.ceil((bx * by) / 8);
 }
 
+/** Bytes of the atlas position field. 2^24 = 16.7M tiles is far past any slot budget. */
+export const ATLAS_POS_BYTES = 3;
+/** Largest atlas position representable on the wire. */
+export const ATLAS_POS_MAX = 0xffffff;
+
 /** Cost in payload bytes of one block (excluding its 1-byte mode). */
 export function blockPayloadCost(blk: BlockData): number {
-  return blk.mode === MODE.MV ? 2 : blk.pixels!.length;
+  switch (blk.mode) {
+    case MODE.MV: return 2;
+    case MODE.ATLAS: return ATLAS_POS_BYTES;
+    case MODE.RAW: return ATLAS_POS_BYTES + blk.pixels!.length;
+  }
 }
 
 export function encodeHello(h: HelloMsg): Buffer {
   const name = Buffer.from(h.name, "ascii");
-  const b = Buffer.alloc(18 + name.length);
+  const b = Buffer.alloc(24 + name.length);
   b.writeUInt8(MSG.HELLO, 0);
   b.writeUInt8(h.version, 1);
   b.writeUInt8(h.block, 2);
@@ -83,7 +120,13 @@ export function encodeHello(h: HelloMsg): Buffer {
   b.writeUInt16BE(h.regionH, 14);
   b.writeUInt8(h.flags, 16);
   b.writeUInt8(name.length, 17);
-  name.copy(b, 18);
+  // atlas geometry lives in HELLO because the decoder must allocate the slots
+  // before the first frame can reference them.
+  b.writeUInt8(h.atlas.tile, 18);
+  b.writeUInt16BE(h.atlas.slotW, 19);
+  b.writeUInt16BE(h.atlas.slotH, 21);
+  b.writeUInt8(h.atlas.slots, 23);
+  name.copy(b, 24);
   return b;
 }
 
@@ -100,7 +143,13 @@ export function decodeHello(b: Buffer): HelloMsg {
     regionW: b.readUInt16BE(12),
     regionH: b.readUInt16BE(14),
     flags: b.readUInt8(16),
-    name: b.subarray(18, 18 + nameLen).toString("ascii"),
+    name: b.subarray(24, 24 + nameLen).toString("ascii"),
+    atlas: {
+      tile: b.readUInt8(18),
+      slotW: b.readUInt16BE(19),
+      slotH: b.readUInt16BE(21),
+      slots: b.readUInt8(23),
+    },
   };
 }
 
@@ -142,8 +191,12 @@ export function encodeFramePart(
       // docs/01 §2: signed values are u8 biased by +128, not two's complement.
       out.writeUInt8(blk.dx! + 128, p); p += 1;
       out.writeUInt8(blk.dy! + 128, p); p += 1;
+    } else if (blk.mode === MODE.ATLAS) {
+      out.writeUInt8(MODE.ATLAS, p); p += 1;
+      out.writeUIntBE(blk.atlasPos!, p, ATLAS_POS_BYTES); p += ATLAS_POS_BYTES;
     } else {
       out.writeUInt8(MODE.RAW, p); p += 1;
+      out.writeUIntBE(blk.atlasPos!, p, ATLAS_POS_BYTES); p += ATLAS_POS_BYTES;
       blk.pixels!.copy(out, p); p += blk.pixels!.length;
     }
   }
@@ -194,8 +247,16 @@ export function decodeFrame(b: Buffer, block: number): FrameMsg {
     if (mode === MODE.MV) {
       blocks.push({ index: i, mode: MODE.MV, dx: b.readUInt8(p) - 128, dy: b.readUInt8(p + 1) - 128 });
       p += 2;
+    } else if (mode === MODE.ATLAS) {
+      blocks.push({ index: i, mode: MODE.ATLAS, atlasPos: b.readUIntBE(p, ATLAS_POS_BYTES) });
+      p += ATLAS_POS_BYTES;
     } else if (mode === MODE.RAW) {
-      blocks.push({ index: i, mode: MODE.RAW, pixels: Buffer.from(b.subarray(p, p + block * block)) });
+      const atlasPos = b.readUIntBE(p, ATLAS_POS_BYTES);
+      p += ATLAS_POS_BYTES;
+      blocks.push({
+        index: i, mode: MODE.RAW, atlasPos,
+        pixels: Buffer.from(b.subarray(p, p + block * block)),
+      });
       p += block * block;
     } else {
       throw new Error(`unknown mode ${mode} at block ${i}`);

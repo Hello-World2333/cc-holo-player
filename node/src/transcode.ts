@@ -12,6 +12,7 @@ import {
   type DitherMode,
 } from "./codec.js";
 import { VERSION, frameParts, decodeFrame } from "./protocol.js";
+import { TileAtlas, autoAtlasCfg, DEFAULT_BUCKET_CAP } from "./atlas.js";
 
 const MAX_MSG = 48 * 1024;
 
@@ -36,6 +37,18 @@ if (!isDitherMode(ditherArg)) {
 }
 const DITHER: DitherMode = ditherArg;
 const DITHER_STRENGTH = parseFloat(arg("dither-strength", "1"));
+// The atlas addresses 8x8 tiles inside offscreen slots; it only makes sense when
+// the block grid matches the tile size.
+const ATLAS_ON = arg("atlas", "on") !== "off";
+const ATLAS_SLOTS = parseInt(arg("atlas-slots", "14"), 10);
+// Fuzzy-candidate budget per lookup. Bigger = better compression, slower encode.
+// 150s clip, block 8: 32->2.92Mbps/61s, 256->2.11Mbps/109s, 512->1.91Mbps/147s,
+// unlimited->1.46Mbps/242s. Default stays faster than realtime; docs/02 §4.2.
+const ATLAS_SCAN = parseInt(arg("atlas-scan", String(DEFAULT_BUCKET_CAP)), 10);
+if (ATLAS_ON && BLOCK !== 8) {
+  console.error(`[transcode] FATAL: --atlas requires --block 8 (got ${BLOCK}); tiles are the block grid`);
+  process.exit(1);
+}
 
 if (W % BLOCK !== 0 || H % BLOCK !== 0) {
   console.error(`[transcode] FATAL: block ${BLOCK} must divide both ${W} and ${H}`);
@@ -70,10 +83,21 @@ const ff = spawn("ffmpeg", [
   "-",
 ], { stdio: ["ignore", "pipe", "inherit"] });
 
+const atlasCfg = ATLAS_ON ? autoAtlasCfg(BLOCK, ATLAS_SLOTS) : { tile: 0, slotW: 0, slotH: 0, slots: 0 };
+if (ATLAS_ON) {
+  console.error(
+    `[transcode] atlas: ${atlasCfg.slots} slots of ${atlasCfg.slotW}x${atlasCfg.slotH} ` +
+    `= ${(atlasCfg.slotW / BLOCK) * (atlasCfg.slotH / BLOCK) * atlasCfg.slots} tiles, ` +
+    `scan<=${ATLAS_SCAN}`,
+  );
+}
+const atlas = ATLAS_ON ? new TileAtlas(atlasCfg, ATLAS_SCAN) : undefined;
+
 const writer = new CcvWriter(ccvPath, {
   version: VERSION, block: BLOCK, fps,
   wallW: W, wallH: H,
   regionX: 0, regionY: 0, regionW: W, regionH: H,
+  atlasSlots: atlasCfg.slots, atlasSlotW: atlasCfg.slotW, atlasSlotH: atlasCfg.slotH,
 });
 
 let prev = new Uint8Array(W * H);
@@ -89,7 +113,7 @@ let driftSum = 0, driftPx = 0, driftMax = 0;
 let buf: Buffer = Buffer.alloc(0);
 let frameIdx = 0;
 let seq = 0;
-let totalRaw = 0, totalMv = 0, totalSkip = 0, totalMsgs = 0, totalBytes = 0;
+let totalRaw = 0, totalMv = 0, totalSkip = 0, totalAtlas = 0, totalMsgs = 0, totalBytes = 0;
 const t0 = Date.now();
 
 ff.stdout.on("data", (chunk: Buffer) => {
@@ -113,7 +137,7 @@ ff.stdout.on("data", (chunk: Buffer) => {
 
     const preSnapA = process.env.DIVERGE_DEBUG ? Uint8Array.from(prev) : null;
     const preSnapB = process.env.DIVERGE_DEBUG ? Uint8Array.from(refPrev) : null;
-    const frames = encodeFrame(cur, prev, { w: W, h: H, block: BLOCK }, seq, opts);
+    const frames = encodeFrame(cur, prev, { w: W, h: H, block: BLOCK }, seq, opts, atlas, frameIdx);
     const dbgBlocks = [];
     const timeMs = Math.round((frameIdx * 1000) / fps);
 
@@ -127,7 +151,7 @@ ff.stdout.on("data", (chunk: Buffer) => {
         // class of bug that an in-memory check cannot see.
         const decoded = decodeFrame(p, BLOCK);
         dbgBlocks.push(...decoded.blocks);
-        applyFrame(refDisplay, refPrev, { w: W, h: H, block: BLOCK }, decoded.blocks);
+        applyFrame(refDisplay, refPrev, { w: W, h: H, block: BLOCK }, decoded.blocks, atlas);
 
         const partIdx = p.readUInt8(4);
         const partTotal = p.readUInt8(5);
@@ -142,6 +166,7 @@ ff.stdout.on("data", (chunk: Buffer) => {
       }
       // measure drift once per SOURCE frame, not per ws part
       totalRaw += f.rawPixels;
+      totalAtlas += f.atlasBlocks;
       totalMv += f.mvBlocks;
       totalSkip += f.skipBlocks;
       seq++;
@@ -213,6 +238,7 @@ ff.on("close", (code) => {
     `${sizeMB.toFixed(1)} MB, ${secs.toFixed(1)}s\n` +
     `  avg raw px/frame=${(totalRaw / Math.max(frameIdx, 1)).toFixed(0)} ` +
     `mv/frame=${(totalMv / Math.max(frameIdx, 1)).toFixed(0)} ` +
+    `atlas/frame=${(totalAtlas / Math.max(frameIdx, 1)).toFixed(0)} ` +
     `skip/frame=${(totalSkip / Math.max(frameIdx, 1)).toFixed(0)}\n` +
     `  avg bitrate=${((totalBytes * 8) / (durationMs / 1000) / 1e6).toFixed(2)} Mbps`,
   );
@@ -222,6 +248,14 @@ ff.on("close", (code) => {
     process.exit(2);
   }
   console.error(`[transcode] bit-exactness OK (encoder model == reference decoder)`);
+  if (atlas) {
+    const a = atlas.stats;
+    console.error(
+      `[transcode] atlas: ${a.lookups} lookups, ${a.hits} hits ` +
+      `(${((a.hits / Math.max(a.lookups, 1)) * 100).toFixed(1)}%), ` +
+      `${a.stores} stores, ${a.evictions} evictions`,
+    );
+  }
   const drift = driftSum / Math.max(driftPx, 1);
   console.error(
     `[transcode] quality: mean displayed-vs-source error = ${drift.toFixed(4)} levels ` +
@@ -237,6 +271,9 @@ ff.on("close", (code) => {
     block: BLOCK,
     dither: DITHER,
     ditherStrength: DITHER === "none" ? 0 : DITHER_STRENGTH,
+    atlas: ATLAS_ON
+      ? { slots: atlasCfg.slots, slotW: atlasCfg.slotW, slotH: atlasCfg.slotH, tile: BLOCK }
+      : null,
     messages: hdr.msgCount,
     bytes: fs.statSync(ccvPath).size,
   }, null, 2));

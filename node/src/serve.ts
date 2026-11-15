@@ -108,6 +108,12 @@ wss.on("connection", (ws, req) => {
     regionH: v.header.regionH,
     flags: 0,
     name: want,
+    atlas: {
+      tile: v.header.block,
+      slotW: v.header.atlasSlotW,
+      slotH: v.header.atlasSlotH,
+      slots: v.header.atlasSlots,
+    },
   }));
 
   const restart = () => {
