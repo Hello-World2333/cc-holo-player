@@ -179,80 +179,140 @@ function mvInBounds(g: Rect, px: number, py: number, dx: number, dy: number): bo
   return px + dx >= 0 && px + dx + B <= g.w && py + dy >= 0 && py + dy + B <= g.h;
 }
 
-function sadAt(
+/**
+ * Sum of per-channel level differences over a block at offset (dx,dy).
+ *
+ * This replaces the old "SAD on packed bytes". The packed byte is
+ * `R<<6 | G<<4 | B<<2 | 3`, so a one-level change in R moves it by 64 and the
+ * same change in B moves it by 4 — the old metric weighted red 16x harder than
+ * blue and could not be interpreted as a visual error at all. Against the old
+ * `mvMad = 0.6` that meant a block had to be very nearly bit-identical to be
+ * accepted as an MV, so real motion fell through to RAW: 8 MV blocks per frame
+ * against 356 RAW on a 576-block grid.
+ *
+ * Returns `sum` over R,G,B in 0..3 level units, or null when the source rect
+ * leaves the region (the hologram throws instead of clamping, see mvInBounds).
+ */
+function sadChan(
   cur: Uint8Array, prev: Uint8Array, g: Rect,
   bi: number, dx: number, dy: number, stride: number,
-): number {
+): number | null {
+  return sadChanStats(cur, prev, g, bi, dx, dy, stride)?.sum ?? null;
+}
+
+/**
+ * Full statistics for reusing a block: total per-channel error, worst single
+ * pixel, and how many pixels differ at all.
+ *
+ * The mean alone is not a usable acceptance test. Measured on real content, a
+ * block could sit at mean 0.10 levels while still containing pixels off by 9
+ * levels (all three channels maximally wrong) — 448 of 576 blocks did. A thin
+ * edge or a dither-pattern pixel simply averages away inside a 20x20 block, and
+ * on screen that reads as exactly the block-shaped ghosting the mean says cannot
+ * be there. So the decision needs the worst pixel and the count, not the average.
+ */
+function sadChanStats(
+  cur: Uint8Array, prev: Uint8Array, g: Rect,
+  bi: number, dx: number, dy: number, stride: number,
+): { sum: number; max: number; diffPx: number; samples: number } | null {
   const B = g.block;
   const { px, py } = blockOrigin(g, bi);
   // Check the WHOLE rect up front: sampling with stride would otherwise accept a
   // candidate whose last row/column falls outside the region.
-  if (!mvInBounds(g, px, py, dx, dy)) return Number.MAX_SAFE_INTEGER;
-  let sad = 0;
+  if (!mvInBounds(g, px, py, dx, dy)) return null;
+  let sum = 0, max = 0, diffPx = 0, samples = 0;
   for (let y = 0; y < B; y += stride) {
-    const ry = py + y + dy;
-    const ci = (py + y) * g.w + px;
-    const ri = ry * g.w + px + dx;
     for (let x = 0; x < B; x += stride) {
-      sad += Math.abs(cur[ci + x] - prev[ri + x]);
+      const a = cur[(py + y) * g.w + px + x];
+      const b = prev[(py + y + dy) * g.w + px + x + dx];
+      samples += 3;
+      if (a === b) continue;
+      diffPx++;
+      const d =
+        Math.abs(((a >> 6) & 3) - ((b >> 6) & 3)) +
+        Math.abs(((a >> 4) & 3) - ((b >> 4) & 3)) +
+        Math.abs(((a >> 2) & 3) - ((b >> 2) & 3));
+      sum += d;
+      if (d > max) max = d;
     }
   }
-  return sad;
+  return { sum, max, diffPx, samples };
 }
 
-/** Full-resolution SAD, clipped to bounds; returns MAX if the source rect escapes. */
-function sadFull(cur: Uint8Array, prev: Uint8Array, g: Rect, bi: number, dx: number, dy: number): number {
-  const B = g.block;
-  const { px, py } = blockOrigin(g, bi);
-  if (!mvInBounds(g, px, py, dx, dy)) return Number.MAX_SAFE_INTEGER;
-  let sad = 0;
-  for (let y = 0; y < B; y++) {
-    let ci = (py + y) * g.w + px;
-    let ri = (py + y + dy) * g.w + px + dx;
-    for (let x = 0; x < B; x++) sad += Math.abs(cur[ci + x] - prev[ri + x]);
-  }
-  return sad;
+/** Number of per-channel samples sadChan accumulates for a given stride. */
+function chanSamples(g: Rect, stride: number): number {
+  const n = Math.ceil(g.block / stride) * Math.ceil(g.block / stride);
+  return n * 3;
 }
-
-const SEARCH_RADIUS = 8;
 
 /**
- * Coarse-then-refine motion search.
- * Returns the best (dx,dy,sad) or null when the best is no better than zero motion.
+ * Motion search, coarse-to-fine, scored by mean per-channel level error.
+ *
+ * The radius matters as much as the metric: at 20 fps an anime pan easily moves
+ * more than 8 px between frames, so a radius of 8 simply cannot express the
+ * motion and everything falls through to RAW. Encoder CPU is free here (offline),
+ * the decode side does not know or care how far we searched.
+ *
+ * `maxErr` is the mean per-channel error we are willing to accept. Since one
+ * quantization step is a whole level, anything up to ~0.5 is below the noise the
+ * codec already introduces by quantizing to 4 levels per channel.
  */
-function searchMV(cur: Uint8Array, prev: Uint8Array, g: Rect, bi: number, sad0: number) {
-  let bestDx = 0, bestDy = 0;
-  let bestSad = sad0;
-  // coarse: step 4 over the window, stride-4 sampling
-  for (let dy = -SEARCH_RADIUS; dy <= SEARCH_RADIUS; dy += 4) {
-    for (let dx = -SEARCH_RADIUS; dx <= SEARCH_RADIUS; dx += 4) {
-      if (dx === 0 && dy === 0) continue;
-      // scale the subsampled SAD up by stride^2 for comparison
-      const s = sadAt(cur, prev, g, bi, dx, dy, 4) * 16;
-      if (s < bestSad) { bestSad = s; bestDx = dx; bestDy = dy; }
+function searchMV(
+  cur: Uint8Array, prev: Uint8Array, g: Rect, bi: number,
+  o: EncOptions,
+): { dx: number; dy: number } | null {
+  const radius = o.searchRadius;
+
+  // Coarse: stride 2 over the full radius, NO threshold. Thresholding during the
+  // coarse stage once discarded the true motion before the refine stage could
+  // see it (mv/frame collapsed to 2). The coarse stage only nominates; the
+  // decision happens at full resolution below.
+  let bx = 0, by = 0;
+  let bestCoarse = sadChan(cur, prev, g, bi, 0, 0, 2) ?? Number.MAX_SAFE_INTEGER;
+  for (let dy = -radius; dy <= radius; dy += 4) {
+    for (let dx = -radius; dx <= radius; dx += 4) {
+      const sum = sadChan(cur, prev, g, bi, dx, dy, 2);
+      if (sum === null) continue;
+      if (sum < bestCoarse) { bestCoarse = sum; bx = dx; by = dy; }
     }
   }
-  if (bestDx === 0 && bestDy === 0) return null;
-  // refine +-3 at full resolution around the coarse winner
-  let rx = bestDx, ry = bestDy, rsad = sadFull(cur, prev, g, bi, bestDx, bestDy);
-  for (let dy = -3; dy <= 3; dy++) {
-    for (let dx = -3; dx <= 3; dx++) {
-      const nx = bestDx + dx, ny = bestDy + dy;
-      const s = sadFull(cur, prev, g, bi, nx, ny);
-      if (s < rsad) { rsad = s; rx = nx; ry = ny; }
+  if (bx === 0 && by === 0) return null;
+
+  // Fine: full resolution around the coarse winner, keeping the candidate only
+  // if the WHOLE block actually passes the reuse test.
+  let pick: { dx: number; dy: number; sum: number } | null = null;
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const nx = bx + dx, ny = by + dy;
+      if (nx === 0 && ny === 0) continue;
+      const st = sadChanStats(cur, prev, g, bi, nx, ny, 1);
+      if (!st) continue;
+      if (!canReuse(st, o)) continue;
+      if (!pick || st.sum < pick.sum) pick = { dx: nx, dy: ny, sum: st.sum };
     }
   }
-  if (rx === 0 && ry === 0) return null;
-  // Belt and braces: a coarse candidate that refine could never improve on would
-  // otherwise survive here with an out-of-region source rect.
-  const { px, py } = blockOrigin(g, bi);
-  if (!mvInBounds(g, px, py, rx, ry)) return null;
-  return { dx: rx, dy: ry, sad: rsad };
+  return pick ? { dx: pick.dx, dy: pick.dy } : null;
 }
 
 export interface EncOptions {
-  /** mean-abs-error (0..3 scale) below which MV is preferred over RAW */
-  mvMad: number;
+  /**
+   * Mean per-channel error (0..3 level units) we accept when REUSING the
+   * previous frame's pixels, whether at zero offset (SKIP) or at the best
+   * motion vector (MV). One quantization step is a full level, so values below
+   * ~0.3 are far smaller than the error quantizing to 4 levels already causes.
+   * Higher = smaller stream, more staleness. See docs/02 §6.5.
+   */
+  copyTol: number;
+  /**
+   * Hard cap on the WORST pixel inside a reused block, in per-channel levels
+   * (0..9 = 3 channels x 3). The mean is not enough: a block can average 0.1
+   * while containing pixels that are completely wrong, and the eye finds those.
+   */
+  copyMaxPx: number;
+  /** Max share of pixels allowed to differ at all inside a reused block (0..1). */
+  copyMaxDiffPct: number;
+  /** Motion search radius in pixels. Encoder-only cost; decode cost unchanged. */
+  searchRadius: number;
   /** estimated microseconds per MV call (from docs/02) */
   mvUs: number;
   /** estimated microseconds per RAW pixel */
@@ -261,8 +321,23 @@ export interface EncOptions {
   budgetMs: number;
 }
 
+/** Can this block (at this offset) be replaced by a copy of prev? */
+function canReuse(
+  st: { sum: number; max: number; diffPx: number; samples: number },
+  o: EncOptions,
+): boolean {
+  return (
+    st.sum / st.samples <= o.copyTol &&
+    st.max <= o.copyMaxPx &&
+    st.diffPx / (st.samples / 3) <= o.copyMaxDiffPct
+  );
+}
+
 export const DEFAULT_OPTS: EncOptions = {
-  mvMad: 0.6,
+  copyTol: 0.25,
+  copyMaxPx: 2,
+  copyMaxDiffPct: 0.3,
+  searchRadius: 24,
   mvUs: 10,
   rawUs: 0.31,
   budgetMs: 25,
@@ -303,11 +378,18 @@ export function encodeFrame(
   let rawPixels = 0, mvBlocks = 0;
 
   for (let bi = 0; bi < nBlocks; bi++) {
-    const sad0 = sadFull(cur, state, g, bi, 0, 0);
-    if (sad0 === 0) continue; // SKIP: display already shows it
+    // SKIP is "copy the previous frame's block at zero offset". It used to
+    // require the packed bytes to be *exactly* equal, which on real content with
+    // dithering almost never holds: measured mean channel error for unsent blocks
+    // sat at a constant 0.13 levels — an eighth of one quantization step — yet
+    // each of those blocks was still paying a full 400-byte RAW retransmission.
+    // Allowing that error under the same tolerance the MV copy uses is what makes
+    // the block grid collapse; see docs/02 §6.5.
+    const zero = sadChanStats(cur, state, g, bi, 0, 0, 1);
+    if (zero && canReuse(zero, opts)) continue;
 
-    const mv = searchMV(cur, state, g, bi, sad0);
-    if (mv && mv.sad / pxPerBlock <= opts.mvMad) {
+    const mv = searchMV(cur, state, g, bi, opts);
+    if (mv) {
       // The CC calls hologram.blitFrameBufferArea, which throws on an
       // out-of-region source index instead of clamping. Reject the vector here
       // rather than emit a frame that kills the player.

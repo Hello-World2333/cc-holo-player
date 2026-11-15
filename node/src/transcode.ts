@@ -44,7 +44,10 @@ if (W % BLOCK !== 0 || H % BLOCK !== 0) {
 
 const opts: EncOptions = {
   ...DEFAULT_OPTS,
-  mvMad: parseFloat(arg("mv-mad", String(DEFAULT_OPTS.mvMad))),
+  copyTol: parseFloat(arg("tol", arg("mv-mad", String(DEFAULT_OPTS.copyTol)))),
+  searchRadius: parseInt(arg("search-radius", String(DEFAULT_OPTS.searchRadius)), 10),
+  copyMaxPx: parseInt(arg("max-px", String(DEFAULT_OPTS.copyMaxPx)), 10),
+  copyMaxDiffPct: parseFloat(arg("max-diff", String(DEFAULT_OPTS.copyMaxDiffPct))),
   budgetMs: parseFloat(arg("budget", String(DEFAULT_OPTS.budgetMs))),
 };
 
@@ -78,6 +81,11 @@ let prev = new Uint8Array(W * H);
 let refDisplay = new Uint8Array(W * H);
 let refPrev = new Uint8Array(W * H);
 let mismatch = 0;
+// Quality accounting: `refDisplay` is what the CC actually shows, `cur` is what
+// we wanted it to show. Tolerant SKIP/MV deliberately leaves stale pixels behind,
+// so this drift is the real cost of the tolerance and must be reported, not
+// assumed. Measured per channel in 0..3 level units, then scaled to 0..255.
+let driftSum = 0, driftPx = 0, driftMax = 0;
 let buf: Buffer = Buffer.alloc(0);
 let frameIdx = 0;
 let seq = 0;
@@ -132,6 +140,7 @@ ff.stdout.on("data", (chunk: Buffer) => {
         totalBytes += p.length;
         totalMsgs++;
       }
+      // measure drift once per SOURCE frame, not per ws part
       totalRaw += f.rawPixels;
       totalMv += f.mvBlocks;
       totalSkip += f.skipBlocks;
@@ -168,6 +177,20 @@ ff.stdout.on("data", (chunk: Buffer) => {
         );
       }
     }
+    {
+      let ds = 0;
+      for (let i = 0; i < W * H; i++) {
+        const a = refDisplay[i], b = cur[i];
+        if (a === b) continue;
+        const d = Math.abs(((a >> 6) & 3) - ((b >> 6) & 3)) +
+                  Math.abs(((a >> 4) & 3) - ((b >> 4) & 3)) +
+                  Math.abs(((a >> 2) & 3) - ((b >> 2) & 3));
+        ds += d;
+        if (d > driftMax) driftMax = d;
+      }
+      driftSum += ds / (W * H * 3);
+      driftPx++;
+    }
     frameIdx++;
     if (frameIdx % 50 === 0) {
       const dt = (Date.now() - t0) / 1000;
@@ -199,6 +222,11 @@ ff.on("close", (code) => {
     process.exit(2);
   }
   console.error(`[transcode] bit-exactness OK (encoder model == reference decoder)`);
+  const drift = driftSum / Math.max(driftPx, 1);
+  console.error(
+    `[transcode] quality: mean displayed-vs-source error = ${drift.toFixed(4)} levels ` +
+    `(${(drift * 85).toFixed(1)}/255), worst pixel = ${driftMax} levels`,
+  );
 
   fs.writeFileSync(path.join(outDir, "meta.json"), JSON.stringify({
     title: path.basename(outDir),
