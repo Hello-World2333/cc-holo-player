@@ -263,7 +263,22 @@ wss.on("connection", (ws, req) => {
           if (myGen !== streamGen) return;   // superseded by a newer SELECT
           if (!got) {
             const why = enc.failure();
-            log(why ? `stream ended (${liveLabel}): ${why}` : `stream ended: ${liveLabel}`);
+            // A clean null with no failure means ffmpeg reached end of file, i.e.
+            // the video simply finished. Stopping there is what froze the wall:
+            // the client keeps the last frame, gets no more messages, and after
+            // STALL_MS its watchdog reconnects as if the link had died.
+            if (why) {
+              log(`stream failed (${liveLabel}): ${why}`);
+              stopLive();
+              return;
+            }
+            if (doLoop && liveItem) {
+              loopCount++;
+              log(`loop ${loopCount} ${liveLabel}`);
+              startLive(liveItem);
+              return;
+            }
+            log(`finished ${liveLabel}`);
             stopLive();
             return;
           }
@@ -314,11 +329,22 @@ wss.on("connection", (ws, req) => {
     }
   };
 
+  /** Which library item is playing, so a finished stream can be restarted. */
+  let liveItem: LibItem | null = null;
+
+  /**
+   * Start (or restart) the stream for `item`.
+   *
+   * A restart after end-of-file is a full reset, not a seek: the atlas, the MV
+   * reference frame and the sequence number all have to go back to frame 0, and
+   * the client has to forget its buffers. That is why looping goes through here
+   * and re-sends HELLO instead of rewinding the existing encoder.
+   */
   const startLive = (item: LibItem): void => {
     streamGen++;
     stopLive();
+    liveItem = item;
     liveLabel = item.title;
-    log(`select ${item.title} (${item.key})`);
     const enc = new LiveEncoder({
       path: item.path,
       fps: FPS, width: W, height: H, block: BLOCK,
@@ -360,7 +386,6 @@ wss.on("connection", (ws, req) => {
         if (!clientReady) {
           clientReady = true;
           log("client READY");
-          if (libraryDir) ws.send(catalogMsg());
         }
         break;
       case MSG.CATALOG_REQ:
@@ -377,8 +402,10 @@ wss.on("connection", (ws, req) => {
         if (!libraryDir) break;
         const key = data.toString("ascii", 1, 1 + KEY_BYTES);
         const it = byKey.get(key);
-        if (it) startLive(it);
-        else log(`select failed: unknown key ${key}`);
+        if (it) {
+          log(`select ${it.title} (${it.key})`);
+          startLive(it);
+        } else log(`select failed: unknown key ${key}`);
         break;
       }
       case MSG.PONG:
@@ -422,9 +449,15 @@ wss.on("connection", (ws, req) => {
     // the client only sends it after a HELLO — but in library mode there is no
     // HELLO until the user picks something. Waiting for READY would deadlock:
     // no HELLO -> no READY -> no catalog -> the user has nothing to pick.
-    // Only the catalog is pushed. Covers are pulled per key via THUMB_REQ:
-    // pushing all 31 would be 286 KB dumped on a connection that may already be
-    // streaming a video, and the client only ever shows six of them at a time.
+    // Only the catalog is pushed, and only here. It used to also be sent on
+    // READY, which meant the client saw it twice and (in the test client) issued
+    // two SELECTs for the same item — the second one restarting the stream that
+    // the first had just started. One catalog per connection, plus CATALOG_REQ
+    // for an explicit resend, is enough.
+    //
+    // Covers are never pushed: 31 of them is 286 KB dumped on a connection that
+    // may already be streaming, and the client only shows six at a time. It asks
+    // per key via THUMB_REQ instead.
     log("client connected (library mode), sending catalog");
     ws.send(catalogMsg());
   }

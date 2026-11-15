@@ -62,6 +62,12 @@ const opts: EncOptions = {
   copyMaxPx: parseInt(arg("max-px", String(DEFAULT_OPTS.copyMaxPx)), 10),
   copyMaxDiffPct: parseFloat(arg("max-diff", String(DEFAULT_OPTS.copyMaxDiffPct))),
   budgetMs: parseFloat(arg("budget", String(DEFAULT_OPTS.budgetMs))),
+  // The atlas tolerances are separate knobs from the MV ones on purpose: a wrong
+  // MV shifts pixels that are still the right colour, while a wrong ATLAS match
+  // substitutes a tile from somewhere else entirely. Being able to zero them
+  // independently is what isolates which one is responsible for an artifact.
+  atlasMaxPx: parseInt(arg("atlas-max-px", String(DEFAULT_OPTS.atlasMaxPx)), 10),
+  atlasMaxMean: parseFloat(arg("atlas-max-mean", String(DEFAULT_OPTS.atlasMaxMean))),
 };
 
 fs.mkdirSync(outDir, { recursive: true });

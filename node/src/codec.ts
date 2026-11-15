@@ -346,9 +346,12 @@ export interface EncOptions {
   /** target per-frame decode budget in ms */
   budgetMs: number;
   /**
-   * Atlas matching tolerance. Tiles are matched with the same per-channel level
-   * error metric as SKIP/MV, and these are the caps used for a match to count.
-   * Measured on real content: 8x8 tiles hit 65-69% at these values.
+   * Atlas matching tolerance, in LEVELS of a single channel (the screen has four
+   * levels per channel, so one level is a third of the range).
+   *
+   * Zero means exact match only, which is the default and the only value that
+   * does not alter the picture — see DEFAULT_OPTS.atlasMaxPx for the reasoning.
+   * Non-zero is kept for experiments, not for shipping.
    */
   atlasMaxPx: number;
   atlasMaxMean: number;
@@ -368,7 +371,14 @@ function canReuse(
 
 export const DEFAULT_OPTS: EncOptions = {
   copyTol: 0.25,
-  copyMaxPx: 2,
+  // One level, not two. The screen has FOUR levels per channel (0/85/170/255),
+  // so a per-pixel allowance of 2 is two thirds of the whole range — a different
+  // colour, not a rounding error. Allowing 2 cost 1.60% of all pixels on
+  // 魔法女仆 (0.42% on 魔术之心, 0.57% on 科学) against 0.61% / 0.18% / 0.44% at 1,
+  // and the price of tightening it is 5-15% more bitrate (0.219 -> 0.251 Mbps).
+  // That is a good trade on a display this shallow: nothing else in the pipeline
+  // can hide a wrong level, because there is no level between the levels.
+  copyMaxPx: 1,
   copyMaxDiffPct: 0.3,
   // 24 was the old default. At block=8 with the atlas enabled, 8 measures within
   // 0.6% of the same bitrate for a third less encoder time (docs/02 §4.2).
@@ -376,8 +386,24 @@ export const DEFAULT_OPTS: EncOptions = {
   mvUs: 10,
   rawUs: 0.31,
   budgetMs: 25,
-  atlasMaxPx: 2,
-  atlasMaxMean: 0.25,
+  // EXACT match only. This looks like a regression in compression and is not.
+  //
+  // bayer8 has a period of exactly 8 pixels and the block size is 8, so two
+  // tiles showing the same colour anywhere on screen are byte-identical. An
+  // approximate match therefore can only ever pair tiles of DIFFERENT colour —
+  // a substituted tile is a colour change by construction, not a lucky reuse.
+  //
+  // The old value of 2 made this plainly visible. The metric summed the three
+  // channels, so "within 2" allowed a single channel to move two levels, i.e.
+  // 67% of that channel on a 4-level screen; and the mean cap let a quarter of
+  // the tile shift by one level. Measured on 魔术之心: 6.19% of all pixels wrong,
+  // with the hair picking up dark horizontal bars as (170,0,0) tiles were
+  // served for (85,0,0) targets. Exact matching brings that to 0.73%, identical
+  // to running with no atlas at all, while still hitting 34.8% of tiles — the
+  // bitrate goes 0.03 -> 0.08 Mbps, and decode cost is unchanged to two
+  // decimal places because SKIP covers the rest either way.
+  atlasMaxPx: 0,
+  atlasMaxMean: 0,
 };
 
 export interface EncodedFrame {

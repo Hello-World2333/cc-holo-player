@@ -197,31 +197,58 @@ export class TileAtlas {
   }
 
   /**
-   * Exact acceptance test, identical in spirit to the SKIP/MV tolerance.
-   * Both caps are checked incrementally: `sum` only grows, so a run that is
-   * already over the mean cap can stop immediately instead of scoring all 64
-   * pixels. This is the hot loop during encoding.
+   * Acceptance test for an approximate tile match.
+   *
+   * The metric is per-CHANNEL, and that is the whole point. The previous version
+   * summed the three channels' absolute differences and compared the total
+   * against `maxPx = 2`. On a 4-level-per-channel screen (0/85/170/255) that is
+   * not a small allowance: a total of 2 permits a single channel to move by two
+   * whole levels, i.e. 67% of that channel's range, or permits red to drop a
+   * level while green and blue each rise a level. Both passed as "within
+   * tolerance" and both are plainly visible — that is what produced the dark
+   * horizontal bars across the hair in 魔术之心.
+   *
+   * So:
+   *  - no single channel may differ by more than `maxChan` levels (default 1,
+   *    which is exactly what a dither phase shift costs);
+   *  - the SIGNED per-channel sums must stay near zero (`maxMean`). This is the
+   *    colour-preservation test: ordered dithering trades pixels against each
+   *    other, so a legitimate phase shift is a wash (+1 here, -1 there), while a
+   *    substituted tile that is uniformly darker has a signed mean of the wrong
+   *    sign and is rejected no matter how few pixels it differs on.
+   *
+   * `sum` is only ever used for the mean caps, so exceeding them can stop early.
    */
-  private match(a: Uint8Array, b: Uint8Array, maxPx: number, maxMean: number): boolean {
+  private match(a: Uint8Array, b: Uint8Array, maxChan: number, maxMean: number): boolean {
     const n = this.tile * this.tile;
-    const sumCap = maxMean * n * 3;
-    let sum = 0;
-    for (let i = 0; i < n; i++) {
+    const nPx = n;
+    // signed accumulators, one per channel, plus the absolute total
+    let sr = 0, sg = 0, sb = 0, absTotal = 0;
+    for (let i = 0; i < nPx; i++) {
       const u = a[i], v = b[i];
       if (u === v) continue;
-      const d =
-        Math.abs(((u >> 6) & 3) - ((v >> 6) & 3)) +
-        Math.abs(((u >> 4) & 3) - ((v >> 4) & 3)) +
-        Math.abs(((u >> 2) & 3) - ((v >> 2) & 3));
-      if (d > maxPx) return false;
-      sum += d;
-      if (sum > sumCap) return false;
+      const dr = ((u >> 6) & 3) - ((v >> 6) & 3);
+      const dg = ((u >> 4) & 3) - ((v >> 4) & 3);
+      const db = ((u >> 2) & 3) - ((v >> 2) & 3);
+      if (dr > maxChan || dr < -maxChan) return false;
+      if (dg > maxChan || dg < -maxChan) return false;
+      if (db > maxChan || db < -maxChan) return false;
+      sr += dr; sg += dg; sb += db;
+      absTotal += Math.abs(dr) + Math.abs(dg) + Math.abs(db);
+    }
+    // Mean of the ABSOLUTE error, in levels per channel.
+    if (absTotal > maxMean * nPx * 3) return false;
+    // Colour preservation: each channel's mean signed drift must stay inside the
+    // same bound. Without this a tile could be uniformly one level darker and
+    // still pass on absolute-error grounds.
+    if (Math.abs(sr) > maxMean * nPx || Math.abs(sg) > maxMean * nPx || Math.abs(sb) > maxMean * nPx) {
+      return false;
     }
     return true;
   }
 
   /** Find an existing tile within tolerance. Returns -1 on miss. */
-  find(t: Uint8Array, frame: number, maxPx: number, maxMean: number): number {
+  find(t: Uint8Array, frame: number, maxChan: number, maxMean: number): number {
     this.stats.lookups++;
 
     // Tier 1: exact content. O(1), no pixel comparisons unless the hash collides.
@@ -240,13 +267,18 @@ export class TileAtlas {
     }
 
     // Tier 2: approximate match within tolerance.
+    //
+    // With maxChan <= 0 there is no useful approximate match to look for, and
+    // scanning the bucket would only waste 256 tile comparisons on a guaranteed
+    // miss. That is the default now — see the note on DEFAULT_OPTS.atlasMaxPx.
+    if (maxChan <= 0) return -1;
     const bucket = this.buckets.get(this.sig(t));
     if (bucket) {
       for (let i = 0; i < bucket.length; i++) {
         const pos = bucket[i];
         const cand = this.tiles[pos];
         if (!cand) continue;
-        if (this.match(cand, t, maxPx, maxMean)) {
+        if (this.match(cand, t, maxChan, maxMean)) {
           this.touch(pos);
           this.stats.hits++;
           return pos;
