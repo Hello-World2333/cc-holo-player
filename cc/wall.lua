@@ -152,6 +152,13 @@ end
 -- ---------- main loop ----------
 local url = cfg.url
 if not url then error("cfg.url missing") end
+-- `name` selects the video. It used to be a silent no-op: the server falls back
+-- to the first directory it finds, so an unset/ignored name played the wrong
+-- film with no warning anywhere — the config said one thing and the screen
+-- showed another. Fold it into the URL unless it is already there.
+if cfg.name and not url:find("video=", 1, true) then
+  url = url .. (url:find("?", 1, true) and "&" or "?") .. "video=" .. tostring(cfg.name)
+end
 
 local function connect()
   say("connecting " .. url)
