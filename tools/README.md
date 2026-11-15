@@ -44,12 +44,16 @@
 | 工具 | 作用 |
 |---|---|
 | `lua_conformance.mjs` | **在 Lua VM 里跑真实的 `cc/decoder.lua`**，用模拟 hologram 外设记录 `blit`/`blitFrameBufferArea`，与 `node/src/codec.ts` 的参考解码器逐像素对比。改解码器后必跑 |
+| `test_codec.mjs` | 量化/抖动的单测：`none` 必须复现 43/128/213 阈值、alpha 恒为 3、Bayer 必须是 0..n²−1 的置换、平坦色块抖动后的均值必须接近原值、ordered 必须逐帧确定。纯算术，<1s |
+| `dither_eval.mjs` | 对比各抖动模式的**8×8 块均值误差**（色带指标）、PSNR 与色阶翻转率。别用 PSNR 评判抖动——它按定义会变差 |
 | `test_settings.mjs` | `cc/settings.lua` + `cc/gui.lua` 的逻辑测试（钳制、落盘往返、按键、双屏互不串扰、中文必须是字面量转义）。纯算术，<1s，改设置页后必跑 |
 | `fake_cc.mjs` | 无头 CC：像真电脑一样连 ws、走完 HELLO/FRAME/ACK 流程并统计帧率码率。不需要进游戏就能验证服务端 |
 | `deploy.sh` | 把 `cc/*.lua` 写进某台电脑的存档目录，自动处理 `padsize` 扩容 |
 
 ```bash
+node tools/test_codec.mjs
 node tools/test_settings.mjs
+node tools/dither_eval.mjs movie.mp4 --frames 60
 node tools/lua_conformance.mjs videos/mimi/video.ccv
 node tools/fake_cc.mjs "ws://127.0.0.1:18756/play?token=dev" --frames 200
 tools/deploy.sh 81

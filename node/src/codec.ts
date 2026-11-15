@@ -7,20 +7,139 @@ import { BlockData, MODE, FRAME_FLAG_KEY } from "./protocol.js";
 /** 2-bit-per-channel palette levels; must match the CC side's setColorMapping. */
 export const LEVELS = [0, 85, 170, 255];
 
-/** Map an 8-bit channel value to a 2-bit level index. */
-function q(c: number): number {
-  // 0..42 -> 0, 43..127 -> 1, 128..212 -> 2, else 3
-  if (c < 43) return 0;
-  if (c < 128) return 1;
-  if (c < 213) return 2;
-  return 3;
+/** Distance between adjacent levels. */
+const STEP = 85;
+
+/**
+ * Map a channel value to a 2-bit level index.
+ * `offset` shifts the decision thresholds, which is all dithering is.
+ *
+ * Written as round((v+offset)/85) rather than the old explicit threshold chain
+ * (43/128/213) because that form makes the dither offset expressible at all; the
+ * two agree exactly at offset 0 (43 -> 0.505 -> 1, 213 -> 2.506 -> 3).
+ */
+function q(c: number, offset = 0): number {
+  const x = (c + offset) / STEP;
+  if (x <= 0) return 0;
+  if (x >= 3) return 3;
+  return Math.round(x);
 }
 
-/** RGB24 -> 1 byte per pixel (R2 G2 B2 A2=3), row-major. */
-export function quantize(rgb: Uint8Array, w: number, h: number): Uint8Array {
+/** Recursive Bayer matrix of size n (n a power of two), values 0..n*n-1. */
+function bayer(n: number): number[][] {
+  if (n === 1) return [[0]];
+  const half = bayer(n / 2);
+  const h = n / 2;
+  const out: number[][] = [];
+  for (let y = 0; y < n; y++) out.push(new Array(n).fill(0));
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < h; x++) {
+      const v = half[y][x] * 4;
+      out[y][x] = v + 0;
+      out[y][x + h] = v + 2;
+      out[y + h][x] = v + 3;
+      out[y + h][x + h] = v + 1;
+    }
+  }
+  return out;
+}
+
+const BAYER4 = bayer(4);
+const BAYER8 = bayer(8);
+
+/**
+ * - `none`   plain nearest-level rounding (the original behaviour)
+ * - `bayer4` / `bayer8`  ordered dither, fixed pattern per screen position
+ * - `fs`     Floyd-Steinberg error diffusion, serpentine
+ *
+ * Ordered dithering is the default for video because the pattern depends only on
+ * (x,y): a static scene quantizes to byte-identical blocks frame after frame, so
+ * SKIP and MV still fire. Error diffusion propagates each pixel's error into its
+ * neighbours, so the tiniest source noise reshuffles the whole downstream
+ * pattern — which this codec cannot afford (see docs/02 §5.1).
+ */
+export type DitherMode = "none" | "bayer4" | "bayer8" | "fs";
+
+export function isDitherMode(s: string): s is DitherMode {
+  return s === "none" || s === "bayer4" || s === "bayer8" || s === "fs";
+}
+
+export interface QuantOpts {
+  dither?: DitherMode;
+  /** 0 disables the effect, 1 is full strength. */
+  strength?: number;
+}
+
+/**
+ * RGB24 -> 1 byte per pixel (R2 G2 B2 A2=3), row-major.
+ *
+ * Alpha is always 3: the hologram treats A=0 as invisible, so an unset alpha
+ * would make every dithered pixel vanish rather than darken.
+ */
+export function quantize(
+  rgb: Uint8Array,
+  w: number,
+  h: number,
+  o: QuantOpts = {},
+): Uint8Array {
+  const mode = o.dither ?? "none";
+  const strength = o.strength ?? 1;
+  if (mode === "fs") return quantizeFS(rgb, w, h, strength);
+
+  const mat = mode === "bayer8" ? BAYER8 : mode === "bayer4" ? BAYER4 : null;
+  // Normalise by the CELL COUNT, not the side length: a Bayer matrix of side n
+  // holds n*n entries, and dividing by n instead made the offset span ±637
+  // instead of ±42.5, which randomises the image instead of dithering it.
+  const cells = mat ? mat.length * mat.length : 0;
   const out = new Uint8Array(w * h);
-  for (let i = 0, p = 0, n = w * h; i < n; i++, p += 3) {
-    out[i] = (q(rgb[p]) << 6) | (q(rgb[p + 1]) << 4) | (q(rgb[p + 2]) << 2) | 3;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * 3;
+      let off = 0;
+      if (mat) {
+        // (m + 0.5)/cells - 0.5 spans (-0.5, 0.5), scaled to one level: ±42.5.
+        const n = mat.length;
+        off = ((mat[y % n][x % n] + 0.5) / cells - 0.5) * STEP * strength;
+      }
+      out[y * w + x] =
+        (q(rgb[p], off) << 6) |
+        (q(rgb[p + 1], off) << 4) |
+        (q(rgb[p + 2], off) << 2) |
+        3;
+    }
+  }
+  return out;
+}
+
+/** Floyd-Steinberg, serpentine. Error is carried in a two-row float buffer. */
+function quantizeFS(rgb: Uint8Array, w: number, h: number, strength: number): Uint8Array {
+  const out = new Uint8Array(w * h);
+  const rowLen = (w + 2) * 3;
+  let curErr = new Float32Array(rowLen);
+  let nextErr = new Float32Array(rowLen);
+  for (let y = 0; y < h; y++) {
+    nextErr.fill(0);
+    const ltr = (y & 1) === 0;
+    for (let k = 0; k < w; k++) {
+      const x = ltr ? k : w - 1 - k;
+      const p = (y * w + x) * 3;
+      const ci = (x + 1) * 3;   // +1 column of padding so ci-3 / ci+3 stay in range
+      let packed = 0;
+      for (let c = 0; c < 3; c++) {
+        const want = rgb[p + c] + curErr[ci + c];
+        const lv = q(want);
+        const err = (want - lv * STEP) * strength;
+        packed |= lv << (6 - c * 2);
+        // right 7/16, down-left 3/16, down 5/16, down-right 1/16 (mirrored for rtl)
+        const fwd = ltr ? 3 : -3;
+        curErr[ci + fwd + c] += (err * 7) / 16;
+        nextErr[ci - fwd + c] += (err * 3) / 16;
+        nextErr[ci + c] += (err * 5) / 16;
+        nextErr[ci + fwd + c] += err / 16;
+      }
+      out[y * w + x] = packed | 3;
+    }
+    const t = curErr; curErr = nextErr; nextErr = t;
   }
   return out;
 }

@@ -8,7 +8,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CcvWriter } from "./container.js";
 import {
-  DEFAULT_OPTS, encodeFrame, quantize, applyFrame, EncOptions,
+  DEFAULT_OPTS, encodeFrame, quantize, applyFrame, isDitherMode, EncOptions,
+  type DitherMode,
 } from "./codec.js";
 import { VERSION, frameParts, decodeFrame } from "./protocol.js";
 
@@ -28,6 +29,13 @@ const W = parseInt(arg("w", "640"), 10);
 const H = parseInt(arg("h", "360"), 10);
 const BLOCK = parseInt(arg("block", "20"), 10);
 const keyEvery = parseInt(arg("key-every", "0"), 10); // 0 = only first frame
+const ditherArg = arg("dither", "bayer8");
+if (!isDitherMode(ditherArg)) {
+  console.error(`[transcode] FATAL: --dither must be one of none|bayer4|bayer8|fs, got "${ditherArg}"`);
+  process.exit(1);
+}
+const DITHER: DitherMode = ditherArg;
+const DITHER_STRENGTH = parseFloat(arg("dither-strength", "1"));
 
 if (W % BLOCK !== 0 || H % BLOCK !== 0) {
   console.error(`[transcode] FATAL: block ${BLOCK} must divide both ${W} and ${H}`);
@@ -45,7 +53,10 @@ const ccvPath = path.join(outDir, "video.ccv");
 
 const FRAME_BYTES = W * H * 3;
 
-console.error(`[transcode] ${inPath} -> ${ccvPath}  ${W}x${H} @${fps}fps block=${BLOCK}`);
+console.error(
+  `[transcode] ${inPath} -> ${ccvPath}  ${W}x${H} @${fps}fps block=${BLOCK} ` +
+  `dither=${DITHER}${DITHER === "none" ? "" : `@${DITHER_STRENGTH}`}`,
+);
 
 const ff = spawn("ffmpeg", [
   "-v", "error",
@@ -79,7 +90,10 @@ ff.stdout.on("data", (chunk: Buffer) => {
     const raw = buf.subarray(0, FRAME_BYTES);
     buf = buf.subarray(FRAME_BYTES);
 
-    const cur = quantize(raw, W, H);
+    // Dithering happens HERE and nowhere else. The CC never learns about it: it
+    // receives the same 1-byte-per-pixel format and blits it, so the cost is
+    // zero on the decode path and the wire format is unchanged.
+    const cur = quantize(raw, W, H, { dither: DITHER, strength: DITHER_STRENGTH });
     const isFirst = frameIdx === 0;
     // force a key frame every `keyEvery` frames, if requested
     const forceKey = isFirst || (keyEvery > 0 && frameIdx % keyEvery === 0);
@@ -193,6 +207,8 @@ ff.on("close", (code) => {
     width: W,
     height: H,
     block: BLOCK,
+    dither: DITHER,
+    ditherStrength: DITHER === "none" ? 0 : DITHER_STRENGTH,
     messages: hdr.msgCount,
     bytes: fs.statSync(ccvPath).size,
   }, null, 2));
