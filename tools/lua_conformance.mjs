@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { readCcvHeader, readCcvRecords, readCcvMessage } from "../node/dist/container.js";
 import { applyFrame } from "../node/dist/codec.js";
+import { TileAtlas } from "../node/dist/atlas.js";
 import { decodeFrame, MSG } from "../node/dist/protocol.js";
 
 const require = createRequire(path.join(import.meta.dirname, "..", "node", "package.json"));
@@ -28,11 +29,29 @@ const W = hdr.regionW, H = hdr.regionH, B = hdr.block;
 console.error(`[conf] ${recs.length} msgs, ${W}x${H} block=${B}`);
 
 // ---------- mock hologram ----------
+// A v2 stream references offscreen atlas slots, so the mock has to model them:
+// id -1 is the display, 0 is prev, 1..N are atlas slots. Buffers have their own
+// dimensions, exactly like the real peripheral, and an out-of-range write is a
+// hard error rather than a silent clip — that mirrors the hologram, which throws
+// ArrayIndexOutOfBoundsException.
 const display = new Uint8Array(W * H);
 const prev = new Uint8Array(W * H);
+const atlasCfg = hdr.atlasSlots > 0
+  ? { tile: hdr.block, slotW: hdr.atlasSlotW, slotH: hdr.atlasSlotH, slots: hdr.atlasSlots }
+  : null;
+const slots = atlasCfg ? Array.from({ length: atlasCfg.slots }, () => new Uint8Array(atlasCfg.slotW * atlasCfg.slotH)) : [];
 let active = -1; // -1 = display
 
-function buf(id) { return id === -1 ? display : prev; }
+function bufOf(id) {
+  if (id === -1) return { data: display, w: W, h: H };
+  if (id === 0) return { data: prev, w: W, h: H };
+  if (atlasCfg && id >= 1 && id <= atlasCfg.slots) {
+    return { data: slots[id - 1], w: atlasCfg.slotW, h: atlasCfg.slotH };
+  }
+  throw new Error(`mock: activateFrameBuffer(${id}) has no such buffer`);
+}
+
+function buf(id) { return bufOf(id).data; }
 
 const blitCalls = { raw: 0, mv: 0 };
 const holo = {
@@ -44,29 +63,35 @@ const holo = {
   sync: () => {},
   blit: (x, y, w, h, tbl) => {
     blitCalls.raw++;
-    const dst = buf(active);
+    const d = bufOf(active);
     for (let j = 0; j < h; j++) {
       for (let i = 0; i < w; i++) {
         const px = x + i, py = y + j;
-        if (px < 0 || px >= W || py < 0 || py >= H) continue;
+        // The real blit clips to the buffer, which is why an atlas tile at the
+        // far edge is legal.
+        if (px < 0 || px >= d.w || py < 0 || py >= d.h) continue;
         const v = tbl.get ? tbl.get(j * w + i) : tbl[j * w + i];
         if (v === undefined) continue;
-        dst[py * W + px] = v & 0xff;
+        d.data[py * d.w + px] = v & 0xff;
       }
     }
   },
   blitFrameBufferArea: (ax, ay, bx, by, bw, bh, bufferId) => {
     blitCalls.mv++;
-    const src = buf(bufferId);
-    const dst = buf(active);
-    if (src === dst) return; // the real API refuses self-copy
+    const s = bufOf(bufferId);
+    const d = bufOf(active);
+    if (s.data === d.data) return; // the real API refuses self-copy
     for (let j = 0; j < bh; j++) {
       for (let i = 0; i < bw; i++) {
         const sx = bx + i, sy = by + j;
         const dx = ax + i, dy = ay + j;
-        if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
-        if (dx < 0 || dx >= W || dy < 0 || dy >= H) continue;
-        dst[dy * W + dx] = src[sy * W + sx];
+        // Source out of range is a hard error (the encoder must not emit such an
+        // MV), destination out of range is clipped like the real API.
+        if (sx < 0 || sx >= s.w || sy < 0 || sy >= s.h) {
+          throw new Error(`mock: MV source (${sx},${sy}) outside ${s.w}x${s.h} buffer ${bufferId}`);
+        }
+        if (dx < 0 || dx >= d.w || dy < 0 || dy >= d.h) continue;
+        d.data[dy * d.w + dx] = s.data[sy * s.w + sx];
       }
     }
   },
@@ -150,6 +175,20 @@ lua.lua_newtable(L);
 const putNum = (k, v) => { lua.lua_pushstring(L, to_luastring(k)); lua.lua_pushnumber(L, v); lua.lua_settable(L, -3); };
 putNum("block", B); putNum("bx", Math.ceil(W / B)); putNum("by", Math.ceil(H / B));
 putNum("regionW", W); putNum("regionH", H); putNum("prevId", 0); putNum("displayId", -1);
+if (atlasCfg) {
+  // The decoder's locate() needs the tile grid; wall.lua derives it from HELLO.
+  putNum("atlasTilesPerRow", Math.floor(atlasCfg.slotW / atlasCfg.tile));
+  putNum("atlasTilesPerSlot", Math.floor(atlasCfg.slotW / atlasCfg.tile) * Math.floor(atlasCfg.slotH / atlasCfg.tile));
+  // atlasIds[i+1] must be the buffer id of slot i, so build a 1-based Lua array.
+  lua.lua_pushstring(L, to_luastring("atlasIds"));
+  lua.lua_newtable(L);
+  for (let i = 0; i < atlasCfg.slots; i++) {
+    lua.lua_pushnumber(L, i + 1);
+    lua.lua_pushnumber(L, i + 1);
+    lua.lua_settable(L, -3);
+  }
+  lua.lua_settable(L, -3);
+}
 lua.lua_setglobal(L, to_luastring("ST"));
 pushObj(holo);
 lua.lua_setglobal(L, to_luastring("H"));
@@ -157,6 +196,7 @@ lua.lua_setglobal(L, to_luastring("H"));
 // ---------- run ----------
 const refDisplay = new Uint8Array(W * H);
 const refPrev = new Uint8Array(W * H);
+const refAtlas = atlasCfg ? new TileAtlas(atlasCfg, 256) : undefined;
 let curSeq = -1, pending = 0, frames = 0, diffs = 0;
 
 for (const r of recs) {
@@ -167,7 +207,7 @@ for (const r of recs) {
   pending--;
 
   // reference
-  applyFrame(refDisplay, refPrev, { w: W, h: H, block: B }, f.blocks);
+  applyFrame(refDisplay, refPrev, { w: W, h: H, block: B }, f.blocks, refAtlas);
 
   // lua
   lua.lua_getglobal(L, to_luastring("decoder"));

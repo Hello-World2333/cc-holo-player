@@ -166,10 +166,17 @@ function M.new(o)
       return self.adjust(-items[self.sel].coarse) and "changed" or nil
     elseif code == keys.right then
       return self.adjust(items[self.sel].coarse) and "changed" or nil
-    elseif code == keys.tab then
-      self.screen = self.screen % #self.settings.SCREENS + 1
+    elseif code == keys.pageDown or code == keys.pageUp then
+      -- Screen tabs moved here from Tab so that Tab means the same thing in both
+      -- control panels ("swap panel"), and because paging between screens and
+      -- paging between library pages are the same gesture.
+      local n = #self.settings.SCREENS
+      if code == keys.pageDown then self.screen = self.screen % n + 1
+      else self.screen = (self.screen - 2) % n + 1 end
       self.sel = 1
       return "screen"
+    elseif code == keys.tab then
+      return "library"
     end
     return nil
   end
@@ -231,7 +238,7 @@ function M.new(o)
       text(self, 12, M.H - 20, self.msg, COL.value)
     else
       text(self, 12, M.H - 20,
-           "Up/Dn  L/R  [ ] fine  R=reset  0=default  Tab=screen  Q=hide", COL.hint)
+           "Up/Dn  L/R  [ ] fine  R=reset  0=def  PgUp/PgDn=screen  Tab=library  Q=hide", COL.hint)
     end
 
     h.sync()

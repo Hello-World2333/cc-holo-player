@@ -11,10 +11,31 @@ export const MSG = {
   FRAME: 0x10,
   ACK: 0x13,
   CONTROL: 0x14,
+  /** server -> client: one 128x72 packed cover for the item with this key */
+  THUMB: 0x15,
+  /** client -> server: "resend the catalog" (no payload) */
+  CATALOG_REQ: 0x16,
+  /** client -> server: key[8]; send just that cover (page-at-a-time on demand) */
+  THUMB_REQ: 0x1a,
+  /** client -> server: 8 bytes ASCII key; switch playback to that item */
+  SELECT: 0x17,
+  /** server -> client: the whole media library, see encodeCatalog */
+  CATALOG: 0x18,
+  /** server -> client: u8 on/off, shown while the server is preparing a stream */
+  LOADING: 0x19,
   STATS: 0x20,
   PING: 0x30,
   PONG: 0x31,
 } as const;
+
+/**
+ * Length of an item key on the wire. The media library is shared with the old
+ * player, whose keys are the first 8 hex digits of sha1(file name), so this is
+ * fixed rather than length-prefixed.
+ */
+export const KEY_BYTES = 8;
+/** Titles are capped so one catalog can never outgrow a websocket frame. */
+export const TITLE_MAX = 96;
 
 /**
  * Block modes. Both reuse modes carry a 3-byte atlas position, so the decoder
@@ -31,6 +52,14 @@ export const MODE = {
 } as const;
 
 export type Mode = 1 | 2 | 3;
+
+/**
+ * Largest websocket message the client accepts. A frame part carries at most
+ * this many bytes; the sender relies on a key frame splitting into ~6 of them.
+ * Both the offline writer and the live encoder must use the same value or the
+ * two produce different splits for the same content.
+ */
+export const MAX_FRAME_BYTES = 48 * 1024;
 
 /** type(1) seq(2) flags(1) part(1) parts(1) bx(1) by(1) = 8 */
 export const FRAME_HDR = 8;
@@ -291,3 +320,93 @@ export function encodeControl(cmd: number, arg = 0): Buffer {
 }
 
 export function encodePing(): Buffer { return Buffer.from([MSG.PING]); }
+
+export interface CatalogItem {
+  /** 8 ASCII bytes */
+  key: string;
+  title: string;
+  durationMs: number;
+}
+
+/**
+ * u8 type | u16 count | count x (key[8] | u16 sec | u16 titleLen | title)
+ *
+ * Binary rather than JSON on purpose: the titles are Chinese, and CC's Lua would
+ * have to round-trip them through a JSON parser and then re-escape them as
+ * literal "\\uXXXX" before drawing (the hologram's drawText only renders CJK from
+ * escapes). Keeping the wire format raw UTF-8 means the client does the escaping
+ * exactly once, in the one place that needs it.
+ */
+export function encodeCatalog(items: CatalogItem[]): Buffer {
+  const parts: Buffer[] = [];
+  const head = Buffer.alloc(3);
+  head.writeUInt8(MSG.CATALOG, 0);
+  head.writeUInt16BE(items.length, 1);
+  parts.push(head);
+  for (const it of items) {
+    let title = Buffer.from(it.title, "utf8");
+    if (title.length > TITLE_MAX) {
+      // Cut on a codepoint boundary, else the client's UTF-8 walker sees a
+      // truncated sequence and emits garbage.
+      title = title.subarray(0, TITLE_MAX);
+      while (title.length > 0 && (title[title.length - 1] & 0xc0) === 0x80) {
+        title = title.subarray(0, title.length - 1);
+      }
+    }
+    const b = Buffer.alloc(KEY_BYTES + 4 + title.length);
+    b.write(it.key, 0, KEY_BYTES, "ascii");
+    b.writeUInt16BE(Math.min(65535, Math.round(it.durationMs / 1000)), KEY_BYTES);
+    b.writeUInt16BE(title.length, KEY_BYTES + 2);
+    title.copy(b, KEY_BYTES + 4);
+    parts.push(b);
+  }
+  return Buffer.concat(parts);
+}
+
+export function decodeCatalog(b: Buffer): CatalogItem[] {
+  const count = b.readUInt16BE(1);
+  const out: CatalogItem[] = [];
+  let p = 3;
+  for (let i = 0; i < count; i++) {
+    const key = b.toString("ascii", p, p + KEY_BYTES);
+    const sec = b.readUInt16BE(p + KEY_BYTES);
+    const len = b.readUInt16BE(p + KEY_BYTES + 2);
+    const title = b.toString("utf8", p + KEY_BYTES + 4, p + KEY_BYTES + 4 + len);
+    p += KEY_BYTES + 4 + len;
+    out.push({ key, title, durationMs: sec * 1000 });
+  }
+  return out;
+}
+
+/** u8 type | u16 w | u16 h | key[8] | packed pixels */
+export function encodeThumb(key: string, w: number, h: number, pixels: Buffer): Buffer {
+  const b = Buffer.alloc(5 + KEY_BYTES + pixels.length);
+  b.writeUInt8(MSG.THUMB, 0);
+  b.writeUInt16BE(w, 1);
+  b.writeUInt16BE(h, 3);
+  b.write(key, 5, KEY_BYTES, "ascii");
+  pixels.copy(b, 5 + KEY_BYTES);
+  return b;
+}
+
+export function encodeSelect(key: string): Buffer {
+  const b = Buffer.alloc(1 + KEY_BYTES);
+  b.writeUInt8(MSG.SELECT, 0);
+  b.write(key, 1, KEY_BYTES, "ascii");
+  return b;
+}
+
+export function encodeLoading(on: boolean): Buffer {
+  return Buffer.from([MSG.LOADING, on ? 1 : 0]);
+}
+
+export function encodeCatalogReq(): Buffer {
+  return Buffer.from([MSG.CATALOG_REQ]);
+}
+
+export function encodeThumbReq(key: string): Buffer {
+  const b = Buffer.alloc(1 + KEY_BYTES);
+  b.writeUInt8(MSG.THUMB_REQ, 0);
+  b.write(key, 1, KEY_BYTES, "ascii");
+  return b;
+}

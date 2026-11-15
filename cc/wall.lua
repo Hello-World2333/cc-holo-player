@@ -82,7 +82,14 @@ end
 pushScreen("main")
 if ctlHolo then pushScreen("ctl") end
 
+-- Two panels share the control hologram: the media library (covers) and the
+-- view settings. Only one is visible at a time; Tab swaps them, Q hides both.
+-- `panel` is the single source of truth so the two cannot both think they own
+-- the screen.
 local gui = nil
+local lib = nil
+local panel = nil          -- "library" | "settings" | nil
+
 if ctlHolo and cfg.gui ~= false then
   local guiMod = dofile("/gui.lua")
   gui = guiMod.new({
@@ -95,10 +102,42 @@ if ctlHolo and cfg.gui ~= false then
   if not ok then
     say("control screen init failed: " .. tostring(err))
     gui = nil
-  else
-    gui.draw()
-    say("control panel ready (Q hides)")
   end
+end
+
+-- The websocket handle, set by connect() and cleared when it closes. The library
+-- panel needs it to request covers and to send SELECT, but it is created later,
+-- so it goes through this single mutable slot instead of a closure parameter.
+local wsRef = nil
+
+local function panelShow(which)
+  if which == "library" then
+    -- A server in file mode never sends a catalog, so there is no library. Fall
+    -- through to settings rather than showing nothing: otherwise the control
+    -- screen is permanently blank and the view cannot be adjusted at all.
+    if not lib then return panelShow("settings") end
+    if panel == "settings" and gui then gui.hide() end
+    panel = "library"
+    lib.show()
+  elseif which == "settings" then
+    if not gui then return end
+    if panel == "library" and lib then lib.hide() end
+    panel = "settings"
+    gui.show()
+  end
+end
+
+local function panelHide()
+  if panel == "library" and lib then lib.hide() end
+  if panel == "settings" and gui then gui.hide() end
+  panel = nil
+end
+
+--- Send a raw message on the live socket, if there is one.
+local function sendRaw(bytes)
+  if not wsRef then return false end
+  local ok = pcall(function() wsRef.send(bytes, true) end)
+  return ok
 end
 
 -- ---------- state ----------
@@ -152,6 +191,19 @@ local function setupFromHello(msg)
   st.prevId = h.allocateFrameBuffer(rw, rh)
   if st.prevId < 0 then error("allocateFrameBuffer failed (slots full?)") end
 
+  -- Both buffers MUST be black before the first frame of a stream.
+  --
+  -- The encoder starts every stream with prev = all zeros, so its first frame
+  -- skips any block that is already black (a 640x360 test clip needed only ~1350
+  -- of 3600 blocks). That assumption only holds if the CC really is black. A
+  -- reconnect, a resync, and a video switch all reuse this same display buffer,
+  -- so without this clear the skipped blocks keep the PREVIOUS video's pixels and
+  -- the new video plays with ghost imagery in every dark region.
+  h.activateFrameBuffer(st.displayId)
+  h.clear(3)
+  h.activateFrameBuffer(st.prevId)
+  h.clear(3)
+
   -- Atlas slots. The hologram caps each slot at 393216 bytes (getMaxBufferSize)
   -- and allows 16 per peripheral. The server picks the geometry and sends it in
   -- HELLO, because tile positions are meaningless without it.
@@ -201,6 +253,7 @@ local function connect()
   say("connecting " .. url)
   local ws, err = http.websocket(url)
   if not ws then error("websocket failed: " .. tostring(err)) end
+  wsRef = ws
   return ws
 end
 
@@ -261,12 +314,27 @@ local function runOnce(ws)
   -- `watchdog` must be declared BEFORE armTimer closes over it: a later
   -- `local watchdog` would leave the closure writing to a global, so
   -- `p1 == watchdog` would never match and the timer would fire unnoticed.
+  local streaming = false
+  local coversPainted, coversLogged = 0, false
   local watchdog
   local function armTimer()
     pcall(os.cancelTimer, watchdog)
     watchdog = os.startTimer(1)
   end
   armTimer()
+
+  -- Covers are painted from a timer, not from the frame path: one 128x72 blit is
+  -- ~7ms (9216 table entries plus the Java draw), so doing it inline would eat a
+  -- fifth of every frame's 50ms budget. 120ms between batches keeps the cost
+  -- under 6% of the budget while still filling a six-cover page in under a
+  -- second. The panel being hidden costs nothing because paintThumbs() returns
+  -- immediately.
+  local thumbTimer
+  local function armThumbTimer()
+    pcall(os.cancelTimer, thumbTimer)
+    thumbTimer = os.startTimer(0.12)
+  end
+  armThumbTimer()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
@@ -275,10 +343,29 @@ local function runOnce(ws)
       armTimer()
       local wallGap  = nowMs() - lastFrameAt
       local clockGap = os.clock() - lastFrameClock
-      if wallGap > STALL_MS and clockGap > STALL_TICKS then
+      -- Only a stream that HAS started can stall. While the user browses the
+      -- library no frames are expected, and treating that silence as a stall
+      -- would reconnect in a loop and yank the panel out from under the cursor.
+      if streaming and wallGap > STALL_MS and clockGap > STALL_TICKS then
         say(("no frame for %dms (%.1fs of game time), reconnecting")
             :format(wallGap, clockGap))
         return "stalled"
+      end
+
+    elseif ev == "timer" and p1 == thumbTimer then
+      armThumbTimer()
+      if lib and panel == "library" then
+        local n = lib.paintThumbs(8)
+        if n > 0 then
+          coversPainted = coversPainted + n
+          -- Log the first full page only: enough to prove the paint path works
+          -- on a real hologram without spamming wall.log every 6 covers.
+          if coversPainted >= 6 and not coversLogged then
+            coversLogged = true
+            say(("library: %d covers painted, %d items, %d/page")
+                :format(coversPainted, #lib.items, lib.perPage()))
+          end
+        end
       end
 
     elseif ev == "websocket_message" and p1 == url then
@@ -288,6 +375,12 @@ local function runOnce(ws)
       local t = string.byte(msg, 1)
       if t == 0x01 then
         stats.msgs = 0
+        streaming = true
+        -- Reset the stall clock: it has been idle for as long as the user spent
+        -- browsing, so without this the first watchdog tick after HELLO would
+        -- see a huge gap and reconnect immediately.
+        lastFrameAt = nowMs()
+        lastFrameClock = os.clock()
         setupFromHello(msg)
         -- Tell the server we finished resizing/allocating. Without this the
         -- server streams immediately and the very first frame is lost while
@@ -329,6 +422,44 @@ local function runOnce(ws)
                 :format(stats.frames, stats.frames / el, stats.decoded, stats.bytes / 1024 / el, ms))
           end
         end
+      elseif t == 0x18 then
+        -- CATALOG: u8 type | u16 count | count x (key[8] | u16 sec | u16 len | utf8)
+        if not lib then
+          lib = (dofile("/library.lua")).new({
+            h = ctlHolo,
+            send = sendRaw,
+          })
+          local ok2, err2 = lib.init()
+          if not ok2 then
+            say("library init failed: " .. tostring(err2))
+            lib = nil
+            panelShow("settings")
+          end
+        end
+        if lib then
+          local n = string.byte(msg, 2) * 256 + string.byte(msg, 3)
+          local items, p = {}, 4
+          for _ = 1, n do
+            local key = string.sub(msg, p, p + 7)
+            local sec = string.byte(msg, p + 8) * 256 + string.byte(msg, p + 9)
+            local len = string.byte(msg, p + 10) * 256 + string.byte(msg, p + 11)
+            local title = string.sub(msg, p + 12, p + 11 + len)
+            items[#items + 1] = { key = key, title = title, durationMs = sec * 1000 }
+            p = p + 12 + len
+          end
+          lib.setCatalog(items)
+          say(("catalog: %d item(s)"):format(#items))
+          -- The library is the panel a user wants first; settings stays one Tab away.
+          if panel == nil and lib.items[1] then panelShow("library") end
+        end
+
+      elseif t == 0x15 then
+        -- THUMB: u8 type | u16 w | u16 h | key[8] | packed pixels
+        if lib then
+          local key = string.sub(msg, 6, 13)
+          lib.addThumb(key, string.sub(msg, 14))
+        end
+
       elseif t == 0x14 then
         local cmd = string.byte(msg, 2)
         say("control cmd=" .. cmd)
@@ -338,22 +469,40 @@ local function runOnce(ws)
       end
 
     elseif ev == "websocket_closed" and p1 == url then
+      wsRef = nil
       return "closed"
 
-    elseif gui and (ev == "key" or ev == "char") then
+    elseif ev == "key" or ev == "char" then
       -- Shares the video's event loop: editing must not stall the stream, and
       -- there is no second process to race with.
-      if not gui.visible then
-        if (ev == "char" and p1 == "q") or (ev == "key" and p1 == keys.tab) then
-          gui.show()
-        end
-      else
+      if panel == nil then
+        -- Both panels hidden. Open on a char event or Tab, exactly as before.
+        --
+        -- It MUST be one event type only. A letter press emits `key` and then
+        -- `char`; reacting to both would open the library on the key event and
+        -- let the char event that follows close it again (q is the close key), so
+        -- the panel would flash and vanish.
+        if ev == "key" and p1 == keys.tab then panelShow("settings")
+        elseif ev == "char" then panelShow("library") end
+      elseif panel == "library" and lib then
+        local res = (ev == "key") and lib.handleKey(p1) or lib.handleChar(p1)
+        if res == "play" then
+          local it = lib.selected()
+          if it and sendRaw(string.char(0x17) .. it.key) then
+            say("select " .. it.key)
+            -- Collapse to the video while the new stream starts: the first frame
+            -- is a full key frame and the control screen redrawing covers would
+            -- compete with it for the same tick.
+            panelHide()
+          end
+        elseif res == "settings" then panelShow("settings")
+        elseif res == "close" then panelHide()
+        elseif res == "redraw" then lib.draw() end
+      elseif panel == "settings" and gui then
         local res = (ev == "key") and gui.handleKey(p1) or gui.handleChar(p1)
-        if res == "close" then
-          gui.hide()
-        elseif res then
-          gui.draw()
-        end
+        if res == "close" then panelHide()
+        elseif res == "library" then panelShow("library")
+        elseif res then gui.draw() end
       end
 
     elseif ev == "peripheral_detach" or ev == "peripheral" then
@@ -370,6 +519,7 @@ while true do
     sleep(2)
   else
     local ok2, why = pcall(runOnce, ws)
+    wsRef = nil
     pcall(ws.close)
     if not ok2 then
       say("run error: " .. tostring(why))

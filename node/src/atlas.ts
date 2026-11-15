@@ -269,6 +269,13 @@ export class TileAtlas {
     if (pos < 0 || pos >= this.capacity) {
       throw new Error(`atlas: position ${pos} out of range (capacity ${this.capacity})`);
     }
+    // `frame < 0` is the reference decoder mirroring a store the encoder already
+    // made for this very block. Re-indexing here would be actively harmful: it
+    // pushes a duplicate into the signature bucket and refreshes the LRU a second
+    // time, so the off-line transcode produced DIFFERENT atlas decisions than the
+    // live encoder for the same input — verified by comparing the two streams
+    // byte for byte. Verification must not perturb what it is verifying.
+    if (frame < 0 && this.state[pos] === STORED) return;
     if (this.state[pos] === STORED) this.unindex(pos);
     if (this.state[pos] === FREE) this.inFree[pos] = 0;
     this.tiles[pos] = t;

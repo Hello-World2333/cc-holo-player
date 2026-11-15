@@ -28,6 +28,7 @@ cp "$SRC/cc/wall.lua"     "$DST/wall.lua"
 cp "$SRC/cc/decoder.lua"  "$DST/decoder.lua"
 cp "$SRC/cc/settings.lua" "$DST/settings.lua"
 cp "$SRC/cc/gui.lua"      "$DST/gui.lua"
+cp "$SRC/cc/library.lua"  "$DST/library.lua"
 
 # wall.cfg is only created when absent, so an existing config (URL, name, the
 # data-hub pin the control screen lives on) survives a redeploy.
