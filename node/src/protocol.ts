@@ -23,6 +23,31 @@ export const MSG = {
   CATALOG: 0x18,
   /** server -> client: u8 on/off, shown while the server is preparing a stream */
   LOADING: 0x19,
+  /**
+   * The HQ audio track, sent before the video so the client can stage it.
+   *
+   * OPEN carries the total byte count, then CHUNK frames follow, then DONE. The
+   * client answers READY once every byte is inside the speaker buffer, and only
+   * then does the server start the video clock — otherwise the client would
+   * spend the first few hundred ms of the track appending audio while frames
+   * pile up in the socket, and the sound would start late against a video that
+   * is already running. Staging first is also what lets one speakEnd() start all
+   * speakers together.
+   */
+  AUDIO_OPEN: 0x1b,
+  AUDIO_CHUNK: 0x1c,
+  AUDIO_DONE: 0x1d,
+  /** client -> server: audio is buffered, start the stream (no payload) */
+  AUDIO_READY: 0x1e,
+  /**
+   * server -> client: play the staged audio now.
+   *
+   * The track is buffered in the speaker session well before this arrives, so
+   * the call is instant. It is deferred to this point on purpose: the live video
+   * encoder needs 1.4-2.9 s to produce its first frame, and starting the audio
+   * at stage time made the sound lead the picture by exactly that much.
+   */
+  AUDIO_START: 0x1f,
   STATS: 0x20,
   PING: 0x30,
   PONG: 0x31,
@@ -34,6 +59,15 @@ export const MSG = {
  * fixed rather than length-prefixed.
  */
 export const KEY_BYTES = 8;
+
+/**
+ * Audio chunk size. Matches CEEHqLimits.CHUNK_BYTES so the transport slice and
+ * the addon's internal chunking line up; anything above MAX_APPEND_BYTES (256
+ * KiB) would make speakAppend throw.
+ */
+export const AUDIO_CHUNK_BYTES = 32 * 1024;
+/** CEEHqLimits.MAX_APPEND_BYTES — a hard cap enforced by the addon. */
+export const AUDIO_MAX_APPEND = 262144;
 /** Titles are capped so one catalog can never outgrow a websocket frame. */
 export const TITLE_MAX = 96;
 
@@ -409,4 +443,40 @@ export function encodeThumbReq(key: string): Buffer {
   b.writeUInt8(MSG.THUMB_REQ, 0);
   b.write(key, 1, KEY_BYTES, "ascii");
   return b;
+}
+
+/** Start of an audio transfer: u8 type | u32 total ogg bytes. */
+export function encodeAudioOpen(totalBytes: number): Buffer {
+  const b = Buffer.allocUnsafe(5);
+  b.writeUInt8(MSG.AUDIO_OPEN, 0);
+  b.writeUInt32BE(totalBytes, 1);
+  return b;
+}
+
+/** One slice of the ogg track. Payload is the raw bytes, nothing else. */
+export function encodeAudioChunk(bytes: Buffer): Buffer {
+  const b = Buffer.allocUnsafe(1 + bytes.length);
+  b.writeUInt8(MSG.AUDIO_CHUNK, 0);
+  bytes.copy(b, 1);
+  return b;
+}
+
+export function encodeAudioDone(): Buffer {
+  return Buffer.from([MSG.AUDIO_DONE]);
+}
+
+/** Split a track into wire frames. Exported so a test can rebuild the stream. */
+export function audioParts(track: Buffer, chunk = AUDIO_CHUNK_BYTES): Buffer[] {
+  const out: Buffer[] = [encodeAudioOpen(track.length)];
+  for (let i = 0; i < track.length; i += chunk) {
+    out.push(encodeAudioChunk(track.subarray(i, Math.min(i + chunk, track.length))));
+  }
+  out.push(encodeAudioDone());
+  return out;
+}
+
+export const AUDIO_FMT = { PCM16: 1, OGG: 2, MPEG: 3 } as const;
+
+export function encodeAudioStart(): Buffer {
+  return Buffer.from([MSG.AUDIO_START]);
 }

@@ -25,8 +25,11 @@ import { WebSocketServer, WebSocket } from "ws";
 import { readCcvHeader, readCcvRecords, readCcvMessage, CcvHeader, CcvRecord } from "./container.js";
 import {
   encodeHello, decodeAck, encodePing, encodeCatalog, encodeThumb, encodeLoading,
+  audioParts, encodeAudioStart, encodeAudioDone, encodeAudioOpen, encodeAudioChunk,
+  AUDIO_CHUNK_BYTES,
   MSG, VERSION, KEY_BYTES,
 } from "./protocol.js";
+import { getAudioTrack, AudioTrack, AudioOpts, DEFAULT_AUDIO_OPTS } from "./audio.js";
 import { Library, LibItem } from "./library.js";
 import { getThumbnail, THUMB_W, THUMB_H } from "./thumbs.js";
 import { LiveEncoder } from "./live.js";
@@ -58,6 +61,24 @@ const ditherArg = arg("dither", "bayer8");
 if (!isDitherMode(ditherArg)) { log(`bad --dither ${ditherArg}`); process.exit(1); }
 const DITHER: DitherMode = ditherArg;
 const DITHER_STRENGTH = parseFloat(arg("dither-strength", "1"));
+/**
+ * Audio. `--audio 0` disables the whole HQ path, which is the escape hatch if a
+ * speaker run starts misbehaving: video must never be held hostage by sound.
+ */
+const AUDIO_ON = arg("audio", "1") === "1";
+const AUDIO_OPTS: AudioOpts = {
+  ...DEFAULT_AUDIO_OPTS,
+  padSec: parseFloat(arg("audio-pad", String(DEFAULT_AUDIO_OPTS.padSec))),
+  quality: parseFloat(arg("audio-quality", String(DEFAULT_AUDIO_OPTS.quality))),
+  sampleRate: parseInt(arg("audio-rate", String(DEFAULT_AUDIO_OPTS.sampleRate)), 10),
+};
+const AUDIO_VOLUME = parseFloat(arg("audio-volume", "1"));
+/**
+ * How long to wait for the client to finish buffering a track before giving up
+ * and starting the video anyway. 1.5 MB over a loopback websocket plus 48
+ * speakAppend calls takes well under a second; five is generous.
+ */
+const AUDIO_READY_TIMEOUT_MS = parseInt(arg("audio-ready-ms", "5000"), 10);
 
 if (libraryDir && (W % BLOCK !== 0 || H % BLOCK !== 0)) {
   log(`FATAL: block ${BLOCK} must divide ${W}x${H}`);
@@ -189,6 +210,21 @@ wss.on("connection", (ws, req) => {
 
   let live: LiveEncoder | null = null;
   let liveLabel = "";
+
+  /**
+   * Audio handshake state.
+   *
+   * `audioWait` is resolved by the client's AUDIO_READY (or by a timeout). It is
+   * a promise rather than a flag so that the SELECT handler can await it without
+   * blocking the socket's message loop — frames for the *previous* track may
+   * still be draining while the next track is staged.
+   */
+  let audioWait: { resolve: (ok: boolean) => void } | null = null;
+  let audioGeneration = 0;
+  /** Set once the staged track has been told to play, so it only happens once. */
+  let audioStarted = false;
+  /** Audio staged for the current track; null when there is none to start. */
+  let audioPending = false;
   /**
    * Bumped on every SELECT. A `pump()` that was awaiting the previous encoder
    * resolves with null once that encoder is stopped, and without this counter it
@@ -275,7 +311,11 @@ wss.on("connection", (ws, req) => {
             if (doLoop && liveItem) {
               loopCount++;
               log(`loop ${loopCount} ${liveLabel}`);
-              startLive(liveItem);
+              // Restage the audio too: the client's speaker session was consumed
+              // by the pass that just ended, so replaying the video without a new
+              // AUDIO_OPEN would loop the picture silently.
+              const again = liveItem;
+              void beginTrack(again).catch((e) => log(`loop failed: ${(e as Error).message}`));
               return;
             }
             log(`finished ${liveLabel}`);
@@ -293,6 +333,16 @@ wss.on("connection", (ws, req) => {
       const m = pending;
       pending = null;
       if (!open()) return;
+      // Start the staged audio on the tick the first frame leaves for the client.
+      // The track is already buffered inside the speaker session, so this call
+      // does not block; the picture and the sound therefore begin together
+      // instead of the sound leading by the encoder's first-frame latency.
+      if (audioPending && !audioStarted) {
+        audioStarted = true;
+        audioPending = false;
+        ws.send(encodeAudioStart(), { binary: true });
+        log("audio: start sent with first frame");
+      }
       if (!loadingSent) { loadingSent = true; ws.send(encodeLoading(false)); }
       ws.send(m.msg, { binary: true });
       idx++;
@@ -340,6 +390,57 @@ wss.on("connection", (ws, req) => {
    * the client has to forget its buffers. That is why looping goes through here
    * and re-sends HELLO instead of rewinding the existing encoder.
    */
+  /**
+   * Send the whole ogg track and wait for the client to buffer it.
+   *
+   * Returns true when the client confirmed it is staged. Any failure — no audio
+   * stream, no speakers, a slow client — returns false, and the caller starts the
+   * video regardless: the wall is a video player first.
+   */
+  const stageAudio = async (item: LibItem, myGen: number): Promise<boolean> => {
+    if (!AUDIO_ON) return false;
+    audioPending = false;
+    audioStarted = false;
+    let track: AudioTrack;
+    const t0 = Date.now();
+    try {
+      track = await getAudioTrack(
+        { path: item.path, durationMs: item.durationMs },
+        cacheDir,
+        AUDIO_OPTS,
+        log,
+      );
+    } catch (e) {
+      log(`audio: preparation failed: ${(e as Error).message}`);
+      return false;
+    }
+    if (myGen !== streamGen || !open()) return false;
+    log(`audio: ${(track.data.length / 1024).toFixed(0)} KiB, ${track.seconds.toFixed(1)} s` +
+        `${track.cacheHit ? " (cached)" : ` in ${Date.now() - t0}ms`}`);
+
+    const waited = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        log("audio: client did not acknowledge the track, starting video anyway");
+        audioWait = null;
+        resolve(false);
+      }, AUDIO_READY_TIMEOUT_MS);
+      audioWait = {
+        resolve: (ok) => { clearTimeout(timer); audioWait = null; resolve(ok); },
+      };
+    });
+
+    for (const part of audioParts(track.data, AUDIO_CHUNK_BYTES)) {
+      if (!open() || myGen !== streamGen) return false;
+      ws.send(part, { binary: true });
+    }
+    const ok = await waited;
+    if (ok && myGen === streamGen) {
+      audioPending = true;
+      log(`audio: staged on client in ${Date.now() - t0}ms`);
+    }
+    return ok;
+  };
+
   const startLive = (item: LibItem): void => {
     streamGen++;
     stopLive();
@@ -362,10 +463,35 @@ wss.on("connection", (ws, req) => {
     resetPacing();
   };
 
+  /**
+   * Begin a track: stop whatever is playing, stage its audio, then start the
+   * encoder. Shared by SELECT and by the end-of-file loop so that a looping
+   * video gets its audio restaged instead of playing the previous pass's track.
+   */
+  const beginTrack = async (item: LibItem): Promise<void> => {
+    // Bump the generation BEFORE staging so that frames from the outgoing track
+    // stop going out immediately: the client is about to spend time appending
+    // audio and must not have a stale video running underneath it.
+    streamGen++;
+    const myGen = streamGen;
+    stopLive();
+    liveLabel = "";
+    ws.send(encodeLoading(true));
+    const staged = await stageAudio(item, myGen);
+    if (myGen !== streamGen || !open()) return;
+    startLive(item);
+    // A false here is normal when the item has no audio; stageAudio logs why.
+    if (!staged) log("audio: none for this track");
+    void tick();
+  };
+
   const clearThumbs = (): void => { thumbQueue = []; };
   onLibraryChange.add(clearThumbs);
 
   ws.on("close", () => {
+    // Release any await inside stageAudio; otherwise it sits until the timeout
+    // and keeps a listener alive on a dead socket.
+    if (audioWait) audioWait.resolve(false);
     onLibraryChange.delete(clearThumbs);
     if (tickTimer) clearInterval(tickTimer);
     tickTimer = null;
@@ -402,10 +528,20 @@ wss.on("connection", (ws, req) => {
         if (!libraryDir) break;
         const key = data.toString("ascii", 1, 1 + KEY_BYTES);
         const it = byKey.get(key);
-        if (it) {
-          log(`select ${it.title} (${it.key})`);
-          startLive(it);
-        } else log(`select failed: unknown key ${key}`);
+        if (!it) { log(`select failed: unknown key ${key}`); break; }
+        log(`select ${it.title} (${it.key})`);
+        void beginTrack(it).catch((e) => log(`select failed: ${(e as Error).message}`));
+        break;
+      }
+      case MSG.AUDIO_READY: {
+        // u8 status: 0 ok, else the client has no usable audio path. Either way
+        // the wait ends and the video starts; a broken speaker run must not be
+        // able to stop the wall.
+        const st = data.readUInt8(1);
+        if (audioWait) {
+          if (st !== 0) log(`audio: client reports status ${st}`);
+          audioWait.resolve(st === 0);
+        }
         break;
       }
       case MSG.PONG:

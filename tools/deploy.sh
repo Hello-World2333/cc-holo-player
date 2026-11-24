@@ -29,13 +29,14 @@ cp "$SRC/cc/decoder.lua"  "$DST/decoder.lua"
 cp "$SRC/cc/settings.lua" "$DST/settings.lua"
 cp "$SRC/cc/gui.lua"      "$DST/gui.lua"
 cp "$SRC/cc/library.lua"  "$DST/library.lua"
+cp "$SRC/cc/audio.lua"    "$DST/audio.lua"
 
 # wall.cfg is only created when absent, so an existing config (URL, name, the
 # data-hub pin the control screen lives on) survives a redeploy.
 if [[ ! -e "$DST/wall.cfg" ]]; then
   cat > "$DST/wall.cfg" <<'CFG'
 {url="ws://127.0.0.1:18756/play?token=dev", name="mimi", log=true,
- ctlHub=8, ctlPin=3}
+ ctlHub=8, ctlPin=3, audioHub=8, audioPin=4, audioVolume=1.0}
 CFG
   echo "wrote default wall.cfg (ctlHub/ctlPin = control screen pin)"
 fi

@@ -87,6 +87,22 @@ if ctlHolo then pushScreen("ctl") end
 -- `panel` is the single source of truth so the two cannot both think they own
 -- the screen.
 local gui = nil
+local aud = nil
+do
+  local okA, audMod = pcall(dofile, "/audio.lua")
+  if okA and audMod then
+    aud = audMod.new({ cfg = cfg, say = say, volume = cfg.audioVolume or 1.0 })
+    if not aud.available() then
+      -- Not an error: a wall with no speakers is a perfectly good wall. Log it
+      -- once at boot so "why is it silent" has an answer in the log.
+      say("audio: no speaker group found, running video only")
+      aud = nil
+    end
+  else
+    say("audio: module failed to load: " .. tostring(audMod))
+  end
+end
+
 local lib = nil
 local panel = nil          -- "library" | "settings" | nil
 
@@ -460,6 +476,41 @@ local function runOnce(ws)
           lib.addThumb(key, string.sub(msg, 14))
         end
 
+      elseif t == 0x1b then
+        -- AUDIO_OPEN: u8 type | u32 total bytes. Everything after this is the
+        -- track; playback still waits for AUDIO_START.
+        local total = string.byte(msg, 2) * 16777216 + string.byte(msg, 3) * 65536
+                    + string.byte(msg, 4) * 256 + string.byte(msg, 5)
+        if aud then
+          local st = aud.onOpen(total)
+          if st ~= 0 then
+            -- Tell the server straight away so it does not sit through the
+            -- ready timeout: a muted wall must still show pictures promptly.
+            sendBin(ws, string.char(0x1e, st))
+          end
+        else
+          sendBin(ws, string.char(0x1e, 1))
+        end
+
+      elseif t == 0x1c then
+        -- AUDIO_CHUNK: raw ogg bytes from offset 2.
+        if aud then aud.onChunk(string.sub(msg, 2)) end
+
+      elseif t == 0x1d then
+        -- AUDIO_DONE: the whole track is buffered. Report readiness; the server
+        -- answers with AUDIO_START once its first video frame exists.
+        if aud then
+          local st = aud.onDone()
+          sendBin(ws, string.char(0x1e, st))
+        else
+          sendBin(ws, string.char(0x1e, 1))
+        end
+
+      elseif t == 0x1f then
+        -- AUDIO_START: play it. All speakers on the cable run start on the tick
+        -- this returns, which is what keeps them in sync with each other.
+        if aud then aud.onStart() end
+
       elseif t == 0x14 then
         local cmd = string.byte(msg, 2)
         say("control cmd=" .. cmd)
@@ -470,6 +521,10 @@ local function runOnce(ws)
 
     elseif ev == "websocket_closed" and p1 == url then
       wsRef = nil
+      -- Silence the speakers with the link: the addon keeps playing a staged
+      -- track on its own, so a dropped connection would otherwise leave the
+      -- audio running over a frozen picture.
+      if aud then aud.stop() end
       return "closed"
 
     elseif ev == "key" or ev == "char" then
