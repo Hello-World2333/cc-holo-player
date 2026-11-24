@@ -11,8 +11,21 @@
 --
 -- That is also why the group handle matters. cee.getSpeakers(pin) returns one
 -- handle covering the whole cable run, and the run is dispatched together, so a
--- single speakEnd() starts all speakers on the same tick. Eight separate handles
--- would start eight independent sounds and drift apart.
+-- single speakEnd() starts all speakers on the same tick. Separate handles would
+-- start separate sounds and drift apart.
+--
+-- Why there are also "extra" handles
+-- ----------------------------------
+-- On the real wall the pin group only covered HALF of the speakers: 16 blocks
+-- exist, getCount() reports 8, and the individual handles then split cleanly
+-- into handles 1..8 (== the group) and handles 9..16 (the other half). Measured
+-- by playing a different pitch on each set and asking the listener, because
+-- nothing in the Lua API exposes which speaker belongs to which run.
+--
+-- Driving only the group therefore leaves half the wall silent. The extras are
+-- staged in the same pass and ended immediately after the group inside the same
+-- tick, which is what keeps them aligned: the addon schedules staged audio
+-- against game time, so every session started in one tick shares a start tick.
 --
 -- Why playback is deferred until AUDIO_START
 -- ------------------------------------------
@@ -36,6 +49,10 @@ M.STATUS_NO_SPEAKER = 1
 M.STATUS_APPEND_FAILED = 2
 M.STATUS_TOO_BIG = 3
 
+-- How many individual handles to look for. CEEHqLimits.MAX_SPEAKERS_PER_TRANSFER
+-- is 64, so probing past that is pointless; this is the hard ceiling.
+local MAX_HANDLES = 64
+
 --- Find the speaker group. `cfg` may pin it explicitly with {hub, pin} so we do
 --- not have to poke at every pin at boot; a pinned handle that turns out to be
 --- empty falls back to the scan, because a stale config must not mute the wall.
@@ -48,19 +65,46 @@ local function findGroup(cfg, say)
     candidates[#candidates + 1] = pin
   end
 
-  local best, bestCount, bestWhere = nil, 0, nil
+  local best, bestCount, bestDesc, bestAddr = nil, 0, nil, nil
   for _, c in ipairs(candidates) do
     local ok, g = pcall(cee.getSpeakers, c)
     if ok and g then
       local okc, cnt = pcall(function() return g.getCount() end)
       if okc and type(cnt) == "number" and cnt > bestCount then
-        best, bestCount = g, cnt
-        bestWhere = type(c) == "table" and ("hub %d pin %d"):format(c[1], c[2]) or ("pin " .. c)
+        best, bestCount, bestAddr = g, cnt, c
+        bestDesc = type(c) == "table" and ("hub %d pin %d"):format(c[1], c[2]) or ("pin " .. c)
       end
     end
   end
-  if best then say(("audio: %d speaker(s) on %s"):format(bestCount, bestWhere)) end
-  return best, bestCount
+  if best then say(("audio: %d speaker(s) on %s"):format(bestCount, bestDesc)) end
+  return best, bestCount, bestAddr
+end
+
+--- Enumerate the speakers the group does NOT cover.
+---
+--- Indices are contiguous and start at 1, with the group's own members occupying
+--- the first `covered` slots, so the extras are simply the next ones. Probing stops
+--- at the first missing index: each getSpeakers() call is a hub lookup that costs
+--- real time on CraftOS, and walking all 64 possible slots stalled this at boot
+--- for over a minute.
+---
+--- Returns an empty table when the group already covers everything, which is the
+--- normal case on a wall wired as a single run.
+local function findExtras(where, covered, say)
+  local extras = {}
+  if not where then return extras end
+  local n = covered + 1
+  while n <= MAX_HANDLES do
+    local ok, h = pcall(cee.getSpeakers, where, n)
+    if not ok or not h then break end
+    extras[#extras + 1] = h
+    n = n + 1
+  end
+  if #extras > 0 then
+    say(("audio: +%d extra speaker(s) beyond the group (indices %d..%d)")
+        :format(#extras, covered + 1, n - 1))
+  end
+  return extras
 end
 
 --- `opts`: { cfg, say, volume }
@@ -83,7 +127,16 @@ function M.new(opts)
     appends = 0,
   }
 
-  self.group, self.count = findGroup(opts.cfg or {}, self.say)
+  local cfg = opts.cfg or {}
+  self.group, self.count, self.addr = findGroup(cfg, self.say)
+  -- The pin group covers only part of the wall on this server (16 speakers, 8 in
+  -- the group). Stage the rest explicitly, unless the config opts out.
+  self.extras = {}
+  if self.group and cfg.audioExtras ~= false then
+    self.extras = findExtras(self.addr, self.count, self.say)
+  elseif self.group then
+    self.say("audio: extras disabled by config")
+  end
   if self.group then
     -- The line voltage caps the achievable volume; asking above it is clamped
     -- by the addon but reading it makes the log self-explanatory when someone
@@ -94,15 +147,18 @@ function M.new(opts)
     end
   end
 
-  local function stopGroup()
+  --- Stop every session this module opened, group and extras alike. A leftover
+  --- session keeps its bytes buffered and blocks the next speakOpen.
+  local function stopAll()
     if self.group then pcall(function() self.group.speakStop() end) end
+    for _, h in ipairs(self.extras) do pcall(function() h.speakStop() end) end
   end
 
   --- Kill whatever is playing. Called on every new SELECT, because the addon
   --- keeps separate per-position sounds alive otherwise and the previous track
   --- would keep going under the new one.
   function self.stop()
-    stopGroup()
+    stopAll()
     self.open, self.appending, self.playing = false, false, false
     self.staged, self.total = 0, 0
   end
@@ -131,6 +187,17 @@ function M.new(opts)
       self.say("audio: speakOpen failed: " .. tostring(err))
       return self.status
     end
+    -- Open the extras BEFORE any append: every session must exist first so the
+    -- appends can go out in one sweep and nothing is left half-open.
+    for i, h in ipairs(self.extras) do
+      local okE, errE = pcall(function() return h.speakOpen(OGG, self.volume) end)
+      if not okE then
+        -- Drop the extra rather than mute the whole wall: losing one speaker is
+        -- better than losing all of them.
+        self.say(("audio: extra %d speakOpen failed (%s), dropping it"):format(i, tostring(errE)))
+        self.extras[i] = nil
+      end
+    end
     self.open = true
     self.appending = true
     self.staged = 0
@@ -153,6 +220,19 @@ function M.new(opts)
         self.open, self.appending = false, false
         pcall(function() self.group.speakStop() end)
         return false
+      end
+      -- Fan the piece out to the extras with the same slicing, so every session
+      -- holds byte-identical audio. Identical payloads matter: the addon dedups
+      -- staged data by content hash, and identical streams are what let the
+      -- sessions be aligned against one another.
+      for i = #self.extras, 1, -1 do
+        local h = self.extras[i]
+        local okE, errE = pcall(function() return h.speakAppend(piece) end)
+        if not okE then
+          self.say(("audio: extra %d speakAppend failed (%s), dropping it"):format(i, tostring(errE)))
+          pcall(function() h.speakStop() end)
+          table.remove(self.extras, i)
+        end
       end
       self.appends = self.appends + 1
       self.staged = self.staged + #piece
@@ -179,8 +259,21 @@ function M.new(opts)
       self.say("audio: speakEnd failed: " .. tostring(err))
       return false
     end
+    -- End the extras immediately after the group, in this same tick. The addon
+    -- schedules playback against game time, so sessions ended together share a
+    -- start tick; splitting them across ticks would produce an audible echo.
+    local failed = 0
+    for i, h in ipairs(self.extras) do
+      local okE, errE = pcall(function() return h.speakEnd() end)
+      if not okE then
+        failed = failed + 1
+        self.say(("audio: extra %d speakEnd failed: %s"):format(i, tostring(errE)))
+      end
+    end
     self.playing = true
-    self.say(("audio: playing %d KiB"):format(math.floor(self.bytes / 1024)))
+    self.say(("audio: playing %d KiB to %d+%d speaker group(s)%s")
+        :format(math.floor(self.bytes / 1024), 1, #self.extras,
+                failed > 0 and (", " .. failed .. " failed") or ""))
     return true
   end
 
@@ -201,6 +294,7 @@ function M.new(opts)
       staged = self.staged,
       status = self.status,
       speakers = self.count,
+      extras = #self.extras,
     }
   end
 
